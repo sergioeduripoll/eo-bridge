@@ -13,7 +13,7 @@ pip install websocket-client==1.7.0
 
 echo "=== [BUILD] Instalando ExpertOptionAPI ==="
 pip install ExpertOptionAPI --no-deps
-pip install requests>=2.31.0
+pip install requests>=2.31.0 simplejson
 
 echo "=== [BUILD] Instalando Flask + Gunicorn ==="
 pip install Flask==3.0.3 gunicorn==22.0.0
