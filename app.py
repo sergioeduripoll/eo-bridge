@@ -225,6 +225,53 @@ def health():
         "python": sys.version.split()[0]
     }), 200
 
+@app.route('/broker-status', methods=['GET'])
+def broker_status():
+    """Health check del broker — verifica conexión y retorna saldo DEMO."""
+    if not check_auth():
+        return jsonify({"status": "error", "message": "No autorizado"}), 401
+
+    if expert is None:
+        return jsonify({
+            "status": "disconnected",
+            "connected": False,
+            "balance": None,
+            "mode": "DEMO"
+        }), 200
+
+    try:
+        # Intentar obtener perfil/saldo
+        balance = None
+        try:
+            profile = expert.Profile()
+            if profile and isinstance(profile, dict):
+                balance = profile.get('demo_balance', profile.get('balance', None))
+            elif profile:
+                balance = str(profile)
+        except Exception as pe:
+            print(f"[BROKER-STATUS] Profile error: {pe}")
+            # Si no funciona Profile(), intentar GetBalance()
+            try:
+                balance = expert.GetBalance()
+            except Exception:
+                pass
+
+        return jsonify({
+            "status": "connected",
+            "connected": True,
+            "balance": balance,
+            "mode": "DEMO",
+            "token_ok": True
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "connected": False,
+            "balance": None,
+            "message": str(e)
+        }), 200
+
 @app.route('/trade', methods=['POST'])
 def trade():
     global expert
@@ -238,33 +285,55 @@ def trade():
     asset_str = data.get('asset', '')
     direction = data.get('direction', '').upper()
 
+    print(f"[TRADE] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print(f"[TRADE] 📥 Petición POST /trade recibida para {asset_str} {direction}")
+
     if direction not in ('BUY', 'SELL'):
+        print(f"[TRADE] ❌ Dirección inválida: {direction}")
         return jsonify({"status": "error", "message": f"Dirección inválida: {direction}"}), 400
 
     if EoApi is None:
+        print(f"[TRADE] ❌ EoApi no cargado")
         return jsonify({"status": "error", "message": "EoApi no cargado — ver logs de debug"}), 503
 
     eo_type = "call" if direction == "BUY" else "put"
     asset_id = ASSET_MAP.get(asset_str, 240)
+    print(f"[TRADE] 📊 Mapeo: {asset_str} → ID:{asset_id} | Tipo: {eo_type} | Monto: ${AMOUNT} | Exp: {EXP_TIME}s")
 
     if not ensure_connection():
+        print(f"[TRADE] ❌ Sin conexión a ExpertOption")
         return jsonify({"status": "error", "message": "Sin conexión a ExpertOption"}), 503
 
     try:
-        expert.Buy(
+        # Forzar cuenta DEMO antes de cada operación
+        print(f"[TRADE] 🔄 Seleccionando cuenta DEMO...")
+        expert.SetDemo()
+
+        print(f"[TRADE] 🎯 Intentando ejecutar {eo_type.upper()} en ExpertOption...")
+        strike = time.time()
+        result = expert.Buy(
             amount=AMOUNT,
             type=eo_type,
             assetid=asset_id,
             exptime=EXP_TIME,
             isdemo=1,
-            strike_time=time.time()
+            strike_time=strike
         )
-        msg = f"🎯 {eo_type.upper()} en {asset_str} (ID:{asset_id}) por ${AMOUNT}"
-        print(f"[BRIDGE] {msg}")
-        return jsonify({"status": "success", "asset": asset_str, "direction": direction, "amount": AMOUNT}), 200
+        print(f"[TRADE] ✅ Respuesta cruda del Broker: {result}")
+        print(f"[TRADE] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        return jsonify({
+            "status": "success",
+            "asset": asset_str,
+            "direction": direction,
+            "type": eo_type,
+            "asset_id": asset_id,
+            "amount": AMOUNT,
+            "broker_response": str(result)
+        }), 200
 
     except Exception as e:
-        print(f"[BRIDGE] ❌ Error: {e}")
+        print(f"[TRADE] ❌ Error de ejecución: {e}")
+        print(f"[TRADE] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
         expert = None
         return jsonify({"status": "error", "message": str(e)}), 500
 
