@@ -43,8 +43,8 @@ def connect_expert():
     """Conecta a ExpertOption en modo DEMO."""
     global expert
     try:
-        import ExpertOptionAPI
-        from ExpertOptionAPI.expert import EoApi as ExpertAPI
+        from ExpertOptionAPI import expert
+        ExpertAPI = expert.EoApi
         print("[BRIDGE] Conectando a ExpertOption...")
         expert = ExpertAPI(token=TOKEN, server_region=SERVER)
         expert.connect()
