@@ -8,6 +8,32 @@ import sys
 import time
 import threading
 import subprocess
+
+# ═══════════════════════════════════════════════════════════════════
+# SAFETY: Instalar dependencias faltantes ANTES de importar nada
+# ExpertOptionAPI necesita pause, simplejson, websocket-client
+# pero Render puede cachear un entorno incompleto entre restarts
+# ═══════════════════════════════════════════════════════════════════
+
+def ensure_deps():
+    """Verifica e instala dependencias críticas si faltan."""
+    deps = ['pause', 'simplejson', 'websocket']
+    missing = []
+    for dep in deps:
+        try:
+            __import__(dep)
+        except ImportError:
+            missing.append(dep)
+    if missing:
+        print(f"[SAFETY] Instalando dependencias faltantes: {missing}")
+        pkg_map = {'websocket': 'websocket-client==1.7.0', 'pause': 'pause', 'simplejson': 'simplejson'}
+        for m in missing:
+            pkg = pkg_map.get(m, m)
+            subprocess.run([sys.executable, '-m', 'pip', 'install', pkg, '-q'], check=False)
+        print("[SAFETY] Dependencias instaladas")
+
+ensure_deps()
+
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
