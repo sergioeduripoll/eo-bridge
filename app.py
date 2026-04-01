@@ -1,26 +1,112 @@
 """
-app.py — Puente ExpertOption para Render/Cloud
-Con autenticación, reconexión automática y keep-alive.
+app.py — Puente ExpertOption para Render
+Con debug de dependencias, reconexión, keep-alive y autenticación.
 """
 
 import os
+import sys
 import time
 import threading
+import subprocess
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
 # ═══════════════════════════════════════════════════════════════════
-# CONFIGURACIÓN (usar variables de entorno en Render)
+# DEBUG: Diagnosticar dependencias al arrancar
+# ═══════════════════════════════════════════════════════════════════
+
+print("=" * 60)
+print("[DEBUG] Python version:", sys.version)
+print("[DEBUG] pip list (relevante):")
+try:
+    result = subprocess.run([sys.executable, '-m', 'pip', 'list'], capture_output=True, text=True)
+    for line in result.stdout.split('\n'):
+        low = line.lower()
+        if any(k in low for k in ['expert', 'websocket', 'flask', 'gunicorn']):
+            print(f"  {line}")
+except Exception as e:
+    print(f"  pip list falló: {e}")
+
+# Debug: verificar websocket
+print("[DEBUG] Verificando websocket...")
+try:
+    import websocket
+    print(f"  websocket.__file__: {websocket.__file__}")
+    print(f"  WebSocketApp existe: {hasattr(websocket, 'WebSocketApp')}")
+    if not hasattr(websocket, 'WebSocketApp'):
+        print("  ⚠️ FALTA WebSocketApp — probablemente paquete 'websocket' sin '-client'")
+except ImportError as e:
+    print(f"  ❌ websocket no instalado: {e}")
+
+# Debug: buscar el módulo expert
+print("[DEBUG] Buscando módulo ExpertOption...")
+EoApi = None
+
+# Intento 1: import estándar documentado
+try:
+    from expert import EoApi as _EoApi
+    EoApi = _EoApi
+    print("  ✅ from expert import EoApi → OK")
+except ImportError as e:
+    print(f"  ❌ from expert import EoApi → {e}")
+
+# Intento 2: ruta alternativa PyPI
+if EoApi is None:
+    try:
+        from ExpertOptionAPI.expert import EoApi as _EoApi
+        EoApi = _EoApi
+        print("  ✅ from ExpertOptionAPI.expert import EoApi → OK")
+    except ImportError as e:
+        print(f"  ❌ from ExpertOptionAPI.expert import EoApi → {e}")
+
+# Intento 3: buscar en site-packages directamente
+if EoApi is None:
+    try:
+        import importlib
+        import site
+        sp = site.getsitepackages()
+        print(f"  site-packages: {sp}")
+        for p in sp:
+            expert_path = os.path.join(p, 'expert')
+            if os.path.isdir(expert_path):
+                print(f"  Encontrado: {expert_path}")
+                contents = os.listdir(expert_path)
+                print(f"  Contenido: {contents}")
+        # Intento forzado
+        from expert.api import EoApi as _EoApi
+        EoApi = _EoApi
+        print("  ✅ from expert.api import EoApi → OK")
+    except Exception as e:
+        print(f"  ❌ Búsqueda manual falló: {e}")
+
+# Intento 4: último recurso - importlib
+if EoApi is None:
+    try:
+        import importlib
+        mod = importlib.import_module('expert')
+        print(f"  Módulo expert: {dir(mod)}")
+        if hasattr(mod, 'EoApi'):
+            EoApi = mod.EoApi
+            print("  ✅ expert.EoApi via importlib → OK")
+    except Exception as e:
+        print(f"  ❌ importlib falló: {e}")
+
+if EoApi is None:
+    print("  🔴 NO SE PUDO IMPORTAR EoApi — el bridge arrancará sin conexión")
+else:
+    print(f"  🟢 EoApi cargado correctamente: {EoApi}")
+
+print("=" * 60)
+
+# ═══════════════════════════════════════════════════════════════════
+# CONFIGURACIÓN
 # ═══════════════════════════════════════════════════════════════════
 
 TOKEN = os.environ.get("EO_TOKEN", "")
 SERVER = os.environ.get("EO_SERVER", "wss://fr24g1eu.expertoption.com/")
-# Clave secreta para autenticar requests del bot Node.js
-API_SECRET = os.environ.get("BRIDGE_SECRET", "cambiar_esto_por_clave_segura")
-# Monto por operación (USD demo)
+API_SECRET = os.environ.get("BRIDGE_SECRET", "cambiar_esto")
 AMOUNT = int(os.environ.get("TRADE_AMOUNT", "10"))
-# Expiración en segundos
 EXP_TIME = int(os.environ.get("EXP_TIME", "60"))
 
 ASSET_MAP = {
@@ -34,7 +120,7 @@ ASSET_MAP = {
 }
 
 # ═══════════════════════════════════════════════════════════════════
-# CONEXIÓN A EXPERTOPTION (con reconexión automática)
+# CONEXIÓN A EXPERTOPTION
 # ═══════════════════════════════════════════════════════════════════
 
 expert = None
@@ -42,12 +128,17 @@ expert = None
 def connect_expert():
     """Conecta a ExpertOption en modo DEMO."""
     global expert
+    if EoApi is None:
+        print("[BRIDGE] ❌ EoApi no disponible — no se puede conectar")
+        return False
+    if not TOKEN:
+        print("[BRIDGE] ⚠️ EO_TOKEN no configurado")
+        return False
     try:
-        from ExpertOptionAPI import expert
-        ExpertAPI = expert.EoApi
         print("[BRIDGE] Conectando a ExpertOption...")
-        expert = ExpertAPI(token=TOKEN, server_region=SERVER)
+        expert = EoApi(token=TOKEN, server_region=SERVER)
         expert.connect()
+        time.sleep(2)  # Dar tiempo al WebSocket para establecer
         expert.SetDemo()
         print("[BRIDGE] ✅ Conectado a ExpertOption DEMO")
         return True
@@ -57,42 +148,38 @@ def connect_expert():
         return False
 
 def ensure_connection():
-    """Reconecta si es necesario. Retorna True si hay conexión."""
+    """Reconecta si es necesario."""
     global expert
     if expert is not None:
         return True
     return connect_expert()
 
 # ═══════════════════════════════════════════════════════════════════
-# KEEP-ALIVE: Evita que Render duerma la instancia
-# Hace un self-ping cada 10 minutos
+# KEEP-ALIVE: Evita que Render duerma (ping cada 10 min)
 # ═══════════════════════════════════════════════════════════════════
 
 def keep_alive():
-    """Ping periódico para mantener la instancia activa en Render free."""
     import urllib.request
     render_url = os.environ.get("RENDER_EXTERNAL_URL", "")
     while True:
-        time.sleep(600)  # 10 minutos
+        time.sleep(600)
         if render_url:
             try:
                 urllib.request.urlopen(f"{render_url}/health", timeout=10)
                 print("[KEEP-ALIVE] Ping OK")
             except Exception:
                 pass
-        # Reconectar ExpertOption si se cayó
+        # Reconectar si se cayó
         ensure_connection()
 
-# Arrancar keep-alive en background
 keepalive_thread = threading.Thread(target=keep_alive, daemon=True)
 keepalive_thread.start()
 
 # ═══════════════════════════════════════════════════════════════════
-# MIDDLEWARE DE AUTENTICACIÓN
+# AUTH
 # ═══════════════════════════════════════════════════════════════════
 
 def check_auth():
-    """Verifica header Authorization: Bearer <secret>."""
     auth = request.headers.get('Authorization', '')
     if not auth.startswith('Bearer ') or auth.split(' ', 1)[1] != API_SECRET:
         return False
@@ -107,12 +194,14 @@ def health():
     return jsonify({
         "status": "ok",
         "connected": expert is not None,
-        "mode": "DEMO"
+        "eoapi_loaded": EoApi is not None,
+        "mode": "DEMO",
+        "python": sys.version.split()[0]
     }), 200
 
 @app.route('/trade', methods=['POST'])
 def trade():
-    # Autenticación
+    global expert
     if not check_auth():
         return jsonify({"status": "error", "message": "No autorizado"}), 401
 
@@ -126,10 +215,12 @@ def trade():
     if direction not in ('BUY', 'SELL'):
         return jsonify({"status": "error", "message": f"Dirección inválida: {direction}"}), 400
 
+    if EoApi is None:
+        return jsonify({"status": "error", "message": "EoApi no cargado — ver logs de debug"}), 503
+
     eo_type = "call" if direction == "BUY" else "put"
     asset_id = ASSET_MAP.get(asset_str, 240)
 
-    # Asegurar conexión
     if not ensure_connection():
         return jsonify({"status": "error", "message": "Sin conexión a ExpertOption"}), 503
 
@@ -142,29 +233,27 @@ def trade():
             isdemo=1,
             strike_time=time.time()
         )
-        print(f"[BRIDGE] 🎯 {eo_type.upper()} en {asset_str} (ID:{asset_id}) por ${AMOUNT}")
-        return jsonify({
-            "status": "success",
-            "asset": asset_str,
-            "direction": direction,
-            "type": eo_type,
-            "amount": AMOUNT
-        }), 200
+        msg = f"🎯 {eo_type.upper()} en {asset_str} (ID:{asset_id}) por ${AMOUNT}"
+        print(f"[BRIDGE] {msg}")
+        return jsonify({"status": "success", "asset": asset_str, "direction": direction, "amount": AMOUNT}), 200
 
     except Exception as e:
         print(f"[BRIDGE] ❌ Error: {e}")
-        expert = None  # Forzar reconexión en próximo intento
+        expert = None
         return jsonify({"status": "error", "message": str(e)}), 500
 
 # ═══════════════════════════════════════════════════════════════════
-# MAIN
+# STARTUP
 # ═══════════════════════════════════════════════════════════════════
 
-if TOKEN:
+if TOKEN and EoApi:
     connect_expert()
-else:
-    print("[BRIDGE] ⚠️ EO_TOKEN no configurado — arrancar sin conexión")
+elif not TOKEN:
+    print("[BRIDGE] ⚠️ Arrancando sin EO_TOKEN — configurar en Environment Variables")
+elif not EoApi:
+    print("[BRIDGE] ⚠️ Arrancando sin EoApi — revisar logs de debug arriba")
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 8080))
+    print(f"[BRIDGE] Escuchando en :{port} | Modo: DEMO | Monto: ${AMOUNT}")
     app.run(host='0.0.0.0', port=port, debug=False)
