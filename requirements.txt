@@ -11,3 +11,4 @@ ExpertOptionAPI
 
 # Dependencias explícitas que ExpertOptionAPI necesita
 requests>=2.31.0
+simplejson
