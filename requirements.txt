@@ -1,4 +1,13 @@
-Flask==3.0.0
+# Core
+Flask==3.0.3
+gunicorn==22.0.0
+
+# CRÍTICO: websocket-client DEBE instalarse ANTES de ExpertOptionAPI
+# para evitar conflicto con el paquete "websocket" (sin -client)
 websocket-client==1.7.0
+
+# La API de ExpertOption
 ExpertOptionAPI
-gunicorn==21.2.0
+
+# Dependencias explícitas que ExpertOptionAPI necesita
+requests>=2.31.0
