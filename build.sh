@@ -1,30 +1,33 @@
 #!/bin/bash
 # build.sh — Script de build para Render
-# Garantiza el orden correcto de instalación de dependencias
+# Garantiza el orden correcto de instalación de dependencias y limpieza de conflictos
 
 set -e
 
-echo "=== [BUILD] Limpiando conflictos de websocket ==="
+echo "=== [BUILD] 1. Limpiando conflictos de websocket ==="
 pip uninstall -y websocket 2>/dev/null || true
 pip uninstall -y websocket-client 2>/dev/null || true
 
-echo "=== [BUILD] Instalando websocket-client primero ==="
+echo "=== [BUILD] 2. Instalando motor de comunicación (el bueno) ==="
 pip install websocket-client==1.7.0
 
-echo "=== [BUILD] Instalando ExpertOptionAPI ==="
+echo "=== [BUILD] 3. Instalando dependencias de servidor ==="
+pip install Flask==3.0.3 gunicorn==22.0.0 requests>=2.31.0 simplejson
+
+echo "=== [BUILD] 4. Instalando ExpertOptionAPI sin pisar nada ==="
+# Usamos --no-deps para que no intente bajar el paquete 'websocket' roto
 pip install ExpertOptionAPI --no-deps
-pip install requests>=2.31.0 simplejson
 
-echo "=== [BUILD] Instalando Flask + Gunicorn ==="
-pip install Flask==3.0.3 gunicorn==22.0.0
+echo "=== [BUILD] 5. Verificando integridad de módulos ==="
+python3 -c "import websocket; print(f'✅ websocket-client: {websocket.__file__}')"
+python3 -c "import simplejson; print('✅ simplejson: OK')"
 
-echo "=== [BUILD] Verificando módulos ==="
-python3 -c "import websocket; print(f'websocket: {websocket.__file__}')"
-python3 -c "from expert import EoApi; print('EoApi: OK')" 2>/dev/null || \
-python3 -c "from ExpertOptionAPI.expert import EoApi; print('EoApi (alt): OK')" 2>/dev/null || \
-echo "⚠️ EoApi import fallará — ver debug en app.py"
+# Intentar detectar la ruta de importación de la API
+python3 -c "from expert import EoApi; print('✅ EoApi (standard): OK')" 2>/dev/null || \
+python3 -c "from ExpertOptionAPI.expert import EoApi; print('✅ EoApi (ExpertOptionAPI.expert): OK')" 2>/dev/null || \
+echo "⚠️ Advertencia: No se pudo importar EoApi en build, se reintentará en app.py"
 
-echo "=== [BUILD] pip list ==="
-pip list | grep -i -E "expert|websocket|flask|gunicorn"
+echo "=== [BUILD] 6. Resumen de paquetes instalados ==="
+pip list | grep -i -E "expert|websocket|flask|gunicorn|simplejson"
 
-echo "=== [BUILD] Completo ==="
+echo "=== [BUILD] ¡Proceso completo! ==="
