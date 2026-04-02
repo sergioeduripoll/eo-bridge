@@ -225,6 +225,79 @@ def health():
         "python": sys.version.split()[0]
     }), 200
 
+@app.route('/debug-assets', methods=['GET'])
+def debug_assets():
+    """Descubre los IDs reales de activos en ExpertOption."""
+    if not check_auth():
+        return jsonify({"status": "error", "message": "No autorizado"}), 401
+
+    if expert is None:
+        return jsonify({"status": "error", "message": "No conectado"}), 503
+
+    debug = {}
+
+    # 1. Buscar en msg_by_action (respuestas cacheadas del WS)
+    try:
+        if hasattr(expert, 'msg_by_action') and expert.msg_by_action:
+            mba = expert.msg_by_action
+            debug['msg_by_action_keys'] = list(mba.keys()) if isinstance(mba, dict) else str(type(mba))
+            if isinstance(mba, dict) and 'assets' in mba:
+                assets_data = mba['assets']
+                debug['assets_raw'] = str(assets_data)[:2000]
+            if isinstance(mba, dict) and 'profile' in mba:
+                debug['profile_raw'] = str(mba['profile'])[:1000]
+        else:
+            debug['msg_by_action'] = 'NO_ATTR o vacío'
+    except Exception as e:
+        debug['msg_by_action_error'] = str(e)
+
+    # 2. Buscar en msg_by_ns
+    try:
+        if hasattr(expert, 'msg_by_ns') and expert.msg_by_ns:
+            mbn = expert.msg_by_ns
+            debug['msg_by_ns_keys'] = list(mbn.keys()) if isinstance(mbn, dict) else str(type(mbn))
+            for k, v in (mbn.items() if isinstance(mbn, dict) else []):
+                debug[f'ns_{k}'] = str(v)[:500]
+        else:
+            debug['msg_by_ns'] = 'NO_ATTR o vacío'
+    except Exception as e:
+        debug['msg_by_ns_error'] = str(e)
+
+    # 3. Buscar en results
+    try:
+        if hasattr(expert, 'results') and expert.results:
+            debug['results'] = str(expert.results)[:2000]
+        else:
+            debug['results'] = 'NO_ATTR o vacío'
+    except Exception as e:
+        debug['results_error'] = str(e)
+
+    # 4. Intentar GetCandles con distintos IDs para detectar cuáles son cripto
+    # Los IDs típicos de ExpertOption van del 1 al 300+
+    crypto_names = ['bitcoin', 'btc', 'ethereum', 'eth', 'cardano', 'ada',
+                    'solana', 'sol', 'ripple', 'xrp', 'doge', 'bnb', 'crypto']
+
+    found_assets = {}
+    try:
+        if isinstance(debug.get('msg_by_action_keys'), list):
+            for key in debug['msg_by_action_keys']:
+                val = expert.msg_by_action[key]
+                val_str = str(val).lower()[:500]
+                for cn in crypto_names:
+                    if cn in val_str:
+                        found_assets[key] = str(val)[:300]
+                        break
+    except Exception:
+        pass
+
+    debug['crypto_matches'] = found_assets if found_assets else 'Ninguno encontrado en msg_by_action'
+
+    # Log todo
+    for k, v in debug.items():
+        print(f"[DEBUG-ASSETS] {k}: {v}")
+
+    return jsonify(debug), 200
+
 @app.route('/broker-status', methods=['GET'])
 def broker_status():
     """Health check del broker — verifica conexión y retorna saldo DEMO."""
