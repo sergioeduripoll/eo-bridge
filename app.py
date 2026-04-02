@@ -146,6 +146,43 @@ ASSET_MAP = {
 }
 
 # ═══════════════════════════════════════════════════════════════════
+# CAPTURA DE MENSAJES WS (para descubrir asset IDs)
+# ═══════════════════════════════════════════════════════════════════
+
+WS_CAPTURED = {}  # Almacena mensajes WS interceptados por action
+
+def ws_message_handler(message):
+    """Intercepta todos los mensajes WS para capturar assets, profile, etc."""
+    try:
+        import json
+        if isinstance(message, str):
+            data = json.loads(message)
+        elif isinstance(message, dict):
+            data = message
+        else:
+            return
+
+        action = data.get('action', 'unknown')
+
+        # Capturar acciones que nos interesan
+        if action in ('assets', 'profile', 'environment', 'getCurrency', 'userGroup'):
+            WS_CAPTURED[action] = data
+            print(f"[WS-CAPTURE] ✅ Capturado '{action}': {str(data)[:500]}")
+
+        # Buscar assets dentro de multipleAction
+        if action == 'multipleAction':
+            actions = data.get('message', data.get('data', []))
+            if isinstance(actions, list):
+                for sub in actions:
+                    if isinstance(sub, dict):
+                        sub_action = sub.get('action', sub.get('a', ''))
+                        if sub_action in ('assets', 'profile'):
+                            WS_CAPTURED[sub_action] = sub
+                            print(f"[WS-CAPTURE] ✅ Capturado '{sub_action}' (dentro de multipleAction): {str(sub)[:500]}")
+    except Exception as e:
+        pass  # No romper el WS por un error de captura
+
+# ═══════════════════════════════════════════════════════════════════
 # CONEXIÓN A EXPERTOPTION
 # ═══════════════════════════════════════════════════════════════════
 
@@ -163,9 +200,29 @@ def connect_expert():
     try:
         print("[BRIDGE] Conectando a ExpertOption...")
         expert = EoApi(token=TOKEN, server_region=SERVER)
+
+        # Registrar callback custom para capturar mensajes WS
+        if hasattr(expert, 'message_callback'):
+            original_cb = expert.message_callback
+            def combined_cb(msg):
+                ws_message_handler(msg)
+                if original_cb:
+                    return original_cb(msg)
+            expert.message_callback = combined_cb
+            print("[BRIDGE] Callback WS registrado")
+
         expert.connect()
-        time.sleep(2)  # Dar tiempo al WebSocket para establecer
+        time.sleep(3)  # Más tiempo para recibir assets
         expert.SetDemo()
+
+        # Imprimir lo que capturamos
+        if WS_CAPTURED:
+            print(f"[BRIDGE] Mensajes WS capturados: {list(WS_CAPTURED.keys())}")
+            for k, v in WS_CAPTURED.items():
+                print(f"[BRIDGE] {k}: {str(v)[:300]}")
+        else:
+            print("[BRIDGE] ⚠️ No se capturaron mensajes WS (callback puede no funcionar con esta librería)")
+
         print("[BRIDGE] ✅ Conectado a ExpertOption DEMO")
         return True
     except Exception as e:
@@ -291,6 +348,31 @@ def debug_assets():
         pass
 
     debug['crypto_matches'] = found_assets if found_assets else 'Ninguno encontrado en msg_by_action'
+
+    # 5. Datos capturados por nuestro callback WS
+    if WS_CAPTURED:
+        debug['ws_captured_keys'] = list(WS_CAPTURED.keys())
+        for k, v in WS_CAPTURED.items():
+            debug[f'ws_{k}'] = str(v)[:2000]
+    else:
+        debug['ws_captured'] = 'Vacío — callback puede no funcionar con esta librería'
+
+    # 6. Buscar en nested_dict si existe
+    try:
+        if hasattr(expert, 'nested_dict') and expert.nested_dict:
+            nd = expert.nested_dict
+            debug['nested_dict_type'] = str(type(nd))
+            if isinstance(nd, dict):
+                debug['nested_dict_keys'] = list(nd.keys())[:50]
+                # Buscar crypto keywords en las keys
+                for k in list(nd.keys())[:100]:
+                    k_lower = str(k).lower()
+                    for cn in crypto_names:
+                        if cn in k_lower:
+                            debug[f'nd_match_{k}'] = str(nd[k])[:300]
+            debug['nested_dict_sample'] = str(nd)[:2000]
+    except Exception as e:
+        debug['nested_dict_error'] = str(e)
 
     # Log todo
     for k, v in debug.items():
