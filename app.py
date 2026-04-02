@@ -314,11 +314,10 @@ def trade():
 
     if EoApi is None:
         print(f"[TRADE] ❌ EoApi no cargado")
-        return jsonify({"status": "error", "message": "EoApi no cargado — ver logs de debug"}), 503
+        return jsonify({"status": "error", "message": "EoApi no cargado"}), 503
 
     eo_type = "call" if direction == "BUY" else "put"
     asset_id = ASSET_MAP.get(asset_str, 240)
-    print(f"[TRADE] 📊 Mapeo: {asset_str} → ID:{asset_id} | Tipo: {eo_type} | Monto: ${AMOUNT} | Exp: {EXP_TIME}s")
 
     if not ensure_connection():
         print(f"[TRADE] ❌ Sin conexión a ExpertOption")
@@ -328,11 +327,54 @@ def trade():
         # Forzar cuenta DEMO antes de cada operación
         print(f"[TRADE] 🔄 Seleccionando cuenta DEMO...")
         expert.SetDemo()
+        time.sleep(0.5)
 
-        print(f"[TRADE] 🎯 Intentando ejecutar {eo_type.upper()} en ExpertOption...")
+        # Obtener saldo para calcular 10%
+        trade_amount = AMOUNT  # Fallback al monto fijo
+        try:
+            # Intentar obtener balance de múltiples fuentes
+            balance = None
+
+            # 1. Atributo profile (dict cacheado por la librería)
+            if hasattr(expert, 'profile') and expert.profile:
+                prof = expert.profile
+                print(f"[TRADE] 📊 expert.profile: {str(prof)[:300]}")
+                if isinstance(prof, dict):
+                    balance = prof.get('demo_balance', prof.get('balance', prof.get('d', None)))
+
+            # 2. Atributo msg_by_action (respuestas cacheadas del WS)
+            if balance is None and hasattr(expert, 'msg_by_action') and expert.msg_by_action:
+                mba = expert.msg_by_action
+                if isinstance(mba, dict) and 'profile' in mba:
+                    prof_data = mba['profile']
+                    print(f"[TRADE] 📊 msg_by_action.profile: {str(prof_data)[:300]}")
+                    if isinstance(prof_data, dict):
+                        balance = prof_data.get('demo_balance', prof_data.get('balance', None))
+
+            # 3. Método Profile()
+            if balance is None:
+                prof_result = expert.Profile()
+                print(f"[TRADE] 📊 Profile(): {str(prof_result)[:300]}")
+                if prof_result and isinstance(prof_result, dict):
+                    balance = prof_result.get('demo_balance', prof_result.get('balance', None))
+
+            # Calcular 10% del saldo (entero, mínimo 1)
+            if balance is not None:
+                balance = float(balance)
+                trade_amount = max(1, int(balance * 0.10))
+                print(f"[TRADE] 💰 Saldo: ${balance} → 10% = ${trade_amount}")
+            else:
+                print(f"[TRADE] ⚠️ Saldo no disponible, usando monto fijo: ${trade_amount}")
+
+        except Exception as be:
+            print(f"[TRADE] ⚠️ Error obteniendo saldo: {be} — usando monto fijo: ${trade_amount}")
+
+        print(f"[TRADE] 📊 Mapeo: {asset_str} → ID:{asset_id} | Tipo: {eo_type} | Monto: ${trade_amount} | Exp: {EXP_TIME}s")
+        print(f"[TRADE] 🎯 Ejecutando {eo_type.upper()} en ExpertOption...")
+
         strike = time.time()
         result = expert.Buy(
-            amount=AMOUNT,
+            amount=trade_amount,
             type=eo_type,
             assetid=asset_id,
             exptime=EXP_TIME,
@@ -347,7 +389,7 @@ def trade():
             "direction": direction,
             "type": eo_type,
             "asset_id": asset_id,
-            "amount": AMOUNT,
+            "amount": trade_amount,
             "broker_response": str(result)
         }), 200
 
