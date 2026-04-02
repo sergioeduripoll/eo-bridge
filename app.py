@@ -239,38 +239,58 @@ def broker_status():
             "mode": "DEMO"
         }), 200
 
-    try:
-        # Intentar obtener perfil/saldo
-        balance = None
+    balance = None
+    debug_info = {}
+
+    # Intentar TODOS los métodos posibles para obtener saldo
+    methods_to_try = [
+        ('Profile', lambda: expert.Profile()),
+        ('GetBalance', lambda: expert.GetBalance()),
+        ('GetProfile', lambda: expert.GetProfile()),
+        ('balance attr', lambda: expert.balance if hasattr(expert, 'balance') else 'NO_ATTR'),
+        ('demo_balance attr', lambda: expert.demo_balance if hasattr(expert, 'demo_balance') else 'NO_ATTR'),
+        ('account attr', lambda: expert.account if hasattr(expert, 'account') else 'NO_ATTR'),
+    ]
+
+    for name, fn in methods_to_try:
         try:
-            profile = expert.Profile()
-            if profile and isinstance(profile, dict):
-                balance = profile.get('demo_balance', profile.get('balance', None))
-            elif profile:
-                balance = str(profile)
-        except Exception as pe:
-            print(f"[BROKER-STATUS] Profile error: {pe}")
-            # Si no funciona Profile(), intentar GetBalance()
-            try:
-                balance = expert.GetBalance()
-            except Exception:
-                pass
+            result = fn()
+            debug_info[name] = str(result)[:500] if result is not None else 'None'
+            print(f"[BROKER-STATUS] {name} → {debug_info[name]}")
 
-        return jsonify({
-            "status": "connected",
-            "connected": True,
-            "balance": balance,
-            "mode": "DEMO",
-            "token_ok": True
-        }), 200
+            # Intentar extraer balance del resultado
+            if balance is None and result is not None:
+                if isinstance(result, (int, float)):
+                    balance = result
+                elif isinstance(result, dict):
+                    for key in ['demo_balance', 'balance', 'amount', 'demo', 'd']:
+                        if key in result and result[key] is not None:
+                            balance = result[key]
+                            break
+                elif isinstance(result, str) and result not in ('None', 'NO_ATTR', ''):
+                    try:
+                        balance = float(result)
+                    except ValueError:
+                        pass
+        except Exception as e:
+            debug_info[name] = f"ERROR: {e}"
+            print(f"[BROKER-STATUS] {name} → ERROR: {e}")
 
-    except Exception as e:
-        return jsonify({
-            "status": "error",
-            "connected": False,
-            "balance": None,
-            "message": str(e)
-        }), 200
+    # Debug: listar todos los atributos/métodos del objeto expert
+    try:
+        attrs = [a for a in dir(expert) if not a.startswith('_')]
+        debug_info['available_methods'] = ', '.join(attrs)
+        print(f"[BROKER-STATUS] Métodos disponibles: {', '.join(attrs)}")
+    except Exception:
+        pass
+
+    return jsonify({
+        "status": "connected",
+        "connected": True,
+        "balance": balance,
+        "mode": "DEMO",
+        "debug": debug_info
+    }), 200
 
 @app.route('/trade', methods=['POST'])
 def trade():
