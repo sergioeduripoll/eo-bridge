@@ -136,13 +136,13 @@ AMOUNT = int(os.environ.get("TRADE_AMOUNT", "10"))
 EXP_TIME = int(os.environ.get("EXP_TIME", "60"))
 
 ASSET_MAP = {
-    "BTC/USD":  240,
-    "ETH/USD":  241,
-    "XRP/USD":  243,
-    "ADA/USD":  244,
-    "SOL/USD":  245,
-    "DOGE/USD": 246,
-    "BNB/USD":  247
+    "BTC/USD":  160,
+    "ETH/USD":  162,
+    "XRP/USD":  173,
+    "ADA/USD":  235,
+    "SOL/USD":  464,
+    "DOGE/USD": 463,
+    "BNB/USD":  462
 }
 
 # ═══════════════════════════════════════════════════════════════════
@@ -472,7 +472,10 @@ def trade():
         return jsonify({"status": "error", "message": "EoApi no cargado"}), 503
 
     eo_type = "call" if direction == "BUY" else "put"
-    asset_id = ASSET_MAP.get(asset_str, 240)
+    asset_id = ASSET_MAP.get(asset_str)
+    if asset_id is None:
+        print(f"[TRADE] ⚠️ Activo no mapeado: {asset_str} — operación cancelada")
+        return jsonify({"status": "error", "message": f"Activo no disponible en ExpertOption: {asset_str}"}), 400
 
     if not ensure_connection():
         print(f"[TRADE] ❌ Sin conexión a ExpertOption")
