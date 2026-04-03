@@ -76,6 +76,38 @@ ASSET_MAP = {
 # No mantiene WebSocket abierto → mínimo RAM
 # ═══════════════════════════════════════════════════════════════════
 
+def kill_expert(expert):
+    """Cierre agresivo: WebSocket + hilos de la librería."""
+    if expert is None:
+        return
+    try:
+        if hasattr(expert, 'websocket_client') and expert.websocket_client:
+            expert.websocket_client.close()
+    except Exception:
+        pass
+    # Matar hilos de la librería (ping_thread, websocket_thread)
+    for attr in ['websocket_thread', 'ping_thread']:
+        try:
+            t = getattr(expert, attr, None)
+            if t and hasattr(t, 'is_alive') and t.is_alive():
+                t.join(timeout=1)
+        except Exception:
+            pass
+
+def wait_for_ws(expert, timeout=8):
+    """Espera hasta que el WebSocket esté realmente conectado."""
+    import time as _time
+    start = _time.time()
+    while _time.time() - start < timeout:
+        try:
+            ws = getattr(expert, 'websocket_client', None)
+            if ws and hasattr(ws, 'sock') and ws.sock and ws.sock.connected:
+                return True
+        except Exception:
+            pass
+        _time.sleep(0.5)
+    return False
+
 def execute_trade(asset_str, direction, tf='5M'):
     """Conecta, opera, desconecta. Todo en una llamada."""
     if EoApi is None:
@@ -88,20 +120,23 @@ def execute_trade(asset_str, direction, tf='5M'):
     if asset_id is None:
         return {"status": "error", "message": f"Activo no disponible: {asset_str}"}
 
-    # Mapear timeframe a segundos de expiración
     TF_TO_EXP = {'5M': 300, '15M': 900, '30M': 1800, '1H': 3600}
-    exp_time = TF_TO_EXP.get(tf, 300)  # Default 5 minutos
+    exp_time = TF_TO_EXP.get(tf, 300)
 
     expert = None
-    max_retries = 2
+    max_retries = 3
     for attempt in range(max_retries):
         try:
-            print(f"[TRADE] 🔌 Conectando (intento {attempt + 1})...")
+            print(f"[TRADE] 🔌 Conectando (intento {attempt + 1}/{max_retries})...")
             expert = EoApi(token=TOKEN, server_region=SERVER)
             expert.connect()
-            time.sleep(4)  # 4s para handshake WS completo
 
-            print(f"[TRADE] 🔄 SetDemo...")
+            # Esperar a que el WS esté realmente conectado
+            if wait_for_ws(expert, timeout=10):
+                print(f"[TRADE] ✅ WebSocket conectado")
+            else:
+                print(f"[TRADE] ⚠️ WS no verificado, intentando operar igual...")
+
             expert.SetDemo()
             time.sleep(1)
 
@@ -116,13 +151,9 @@ def execute_trade(asset_str, direction, tf='5M'):
             )
             print(f"[TRADE] ✅ Respuesta: {result}")
 
-            # Cerrar conexión
-            try:
-                if hasattr(expert, 'websocket_client') and expert.websocket_client:
-                    expert.websocket_client.close()
-                print(f"[TRADE] 🔌 Desconectado")
-            except Exception:
-                pass
+            kill_expert(expert)
+            expert = None
+            print(f"[TRADE] 🔌 Desconectado")
 
             return {
                 "status": "success",
@@ -137,18 +168,13 @@ def execute_trade(asset_str, direction, tf='5M'):
 
         except Exception as e:
             print(f"[TRADE] ❌ Intento {attempt + 1} falló: {e}")
-            # Cerrar conexión rota
-            if expert is not None:
-                try:
-                    if hasattr(expert, 'websocket_client') and expert.websocket_client:
-                        expert.websocket_client.close()
-                except Exception:
-                    pass
-                expert = None
+            kill_expert(expert)
+            expert = None
 
             if attempt < max_retries - 1:
-                print(f"[TRADE] 🔄 Reintentando en 3s...")
-                time.sleep(3)
+                wait = 3 + (attempt * 2)  # 3s, 5s
+                print(f"[TRADE] 🔄 Reintentando en {wait}s...")
+                time.sleep(wait)
             else:
                 return {"status": "error", "message": str(e)}
 
