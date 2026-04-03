@@ -93,51 +93,64 @@ def execute_trade(asset_str, direction, tf='5M'):
     exp_time = TF_TO_EXP.get(tf, 300)  # Default 5 minutos
 
     expert = None
-    try:
-        print(f"[TRADE] 🔌 Conectando...")
-        expert = EoApi(token=TOKEN, server_region=SERVER)
-        expert.connect()
-        time.sleep(2)
+    max_retries = 2
+    for attempt in range(max_retries):
+        try:
+            print(f"[TRADE] 🔌 Conectando (intento {attempt + 1})...")
+            expert = EoApi(token=TOKEN, server_region=SERVER)
+            expert.connect()
+            time.sleep(4)  # 4s para handshake WS completo
 
-        print(f"[TRADE] 🔄 SetDemo...")
-        expert.SetDemo()
-        time.sleep(0.5)
+            print(f"[TRADE] 🔄 SetDemo...")
+            expert.SetDemo()
+            time.sleep(1)
 
-        print(f"[TRADE] 🎯 {eo_type.upper()} {asset_str} (ID:{asset_id}) ${AMOUNT} exp:{exp_time}s ({tf})")
-        result = expert.Buy(
-            amount=AMOUNT,
-            type=eo_type,
-            assetid=asset_id,
-            exptime=exp_time,
-            isdemo=1,
-            strike_time=time.time()
-        )
-        print(f"[TRADE] ✅ Respuesta: {result}")
+            print(f"[TRADE] 🎯 {eo_type.upper()} {asset_str} (ID:{asset_id}) ${AMOUNT} exp:{exp_time}s ({tf})")
+            result = expert.Buy(
+                amount=AMOUNT,
+                type=eo_type,
+                assetid=asset_id,
+                exptime=exp_time,
+                isdemo=1,
+                strike_time=time.time()
+            )
+            print(f"[TRADE] ✅ Respuesta: {result}")
 
-        return {
-            "status": "success",
-            "asset": asset_str,
-            "direction": direction,
-            "type": eo_type,
-            "asset_id": asset_id,
-            "amount": AMOUNT,
-            "tf": tf,
-            "exp_seconds": exp_time
-        }
-
-    except Exception as e:
-        print(f"[TRADE] ❌ Error: {e}")
-        return {"status": "error", "message": str(e)}
-
-    finally:
-        # SIEMPRE desconectar para liberar RAM
-        if expert is not None:
+            # Cerrar conexión
             try:
                 if hasattr(expert, 'websocket_client') and expert.websocket_client:
                     expert.websocket_client.close()
                 print(f"[TRADE] 🔌 Desconectado")
             except Exception:
                 pass
+
+            return {
+                "status": "success",
+                "asset": asset_str,
+                "direction": direction,
+                "type": eo_type,
+                "asset_id": asset_id,
+                "amount": AMOUNT,
+                "tf": tf,
+                "exp_seconds": exp_time
+            }
+
+        except Exception as e:
+            print(f"[TRADE] ❌ Intento {attempt + 1} falló: {e}")
+            # Cerrar conexión rota
+            if expert is not None:
+                try:
+                    if hasattr(expert, 'websocket_client') and expert.websocket_client:
+                        expert.websocket_client.close()
+                except Exception:
+                    pass
+                expert = None
+
+            if attempt < max_retries - 1:
+                print(f"[TRADE] 🔄 Reintentando en 3s...")
+                time.sleep(3)
+            else:
+                return {"status": "error", "message": str(e)}
 
 # ═══════════════════════════════════════════════════════════════════
 # KEEP-ALIVE: Solo ping HTTP (no WS)
