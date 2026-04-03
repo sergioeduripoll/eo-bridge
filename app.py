@@ -260,11 +260,28 @@ def execute_trade(asset_str, direction, tf='5M'):
 
             # SetDemo
             expert.SetDemo()
-            time.sleep(1)
 
-            # Descubrir assets dinámicos (solo si cache > 5 min)
-            if time.time() - DYNAMIC_ASSETS_TS > 300:
-                capture_assets_from_ws(expert)
+            # ═══ POLLING ACTIVO: esperar hasta 5s a que lleguen datos del WS ═══
+            balance = None
+            poll_start = time.time()
+            poll_timeout = 5
+            while time.time() - poll_start < poll_timeout:
+                # Intentar capturar assets
+                if not DYNAMIC_ASSETS or time.time() - DYNAMIC_ASSETS_TS > 300:
+                    capture_assets_from_ws(expert)
+
+                # Intentar leer saldo
+                balance = get_demo_balance(expert)
+
+                # Salir si tenemos ambos
+                if balance is not None and balance > 0 and DYNAMIC_ASSETS:
+                    print(f"[TRADE] ✅ Datos listos en {time.time() - poll_start:.1f}s (saldo: ${balance:.0f}, assets: {len(DYNAMIC_ASSETS)})")
+                    break
+
+                time.sleep(0.5)
+            else:
+                elapsed = time.time() - poll_start
+                print(f"[TRADE] ⚠️ Polling agotado ({elapsed:.1f}s) — balance: {balance}, dynamic: {len(DYNAMIC_ASSETS)}")
 
             # Resolver asset ID (dinámico > estático)
             asset_id = resolve_asset_id(asset_str)
@@ -272,9 +289,8 @@ def execute_trade(asset_str, direction, tf='5M'):
                 kill_expert(expert)
                 return {"status": "error", "message": f"Activo no mapeado: {asset_str}"}
 
-            # Leer saldo y calcular 10%
+            # Calcular monto: 10% del saldo (entero, mín 1) o fallback fijo
             trade_amount = AMOUNT
-            balance = get_demo_balance(expert)
             if balance is not None and balance > 0:
                 trade_amount = max(1, int(balance * 0.10))
                 print(f"[TRADE] 💰 Saldo: ${balance:.0f} → 10% = ${trade_amount}")
