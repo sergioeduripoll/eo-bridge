@@ -76,7 +76,7 @@ ASSET_MAP = {
 # No mantiene WebSocket abierto → mínimo RAM
 # ═══════════════════════════════════════════════════════════════════
 
-def execute_trade(asset_str, direction):
+def execute_trade(asset_str, direction, tf='5M'):
     """Conecta, opera, desconecta. Todo en una llamada."""
     if EoApi is None:
         return {"status": "error", "message": "EoApi no cargado"}
@@ -87,6 +87,10 @@ def execute_trade(asset_str, direction):
     asset_id = ASSET_MAP.get(asset_str)
     if asset_id is None:
         return {"status": "error", "message": f"Activo no disponible: {asset_str}"}
+
+    # Mapear timeframe a segundos de expiración
+    TF_TO_EXP = {'5M': 300, '15M': 900, '30M': 1800, '1H': 3600}
+    exp_time = TF_TO_EXP.get(tf, 300)  # Default 5 minutos
 
     expert = None
     try:
@@ -99,12 +103,12 @@ def execute_trade(asset_str, direction):
         expert.SetDemo()
         time.sleep(0.5)
 
-        print(f"[TRADE] 🎯 {eo_type.upper()} {asset_str} (ID:{asset_id}) ${AMOUNT}")
+        print(f"[TRADE] 🎯 {eo_type.upper()} {asset_str} (ID:{asset_id}) ${AMOUNT} exp:{exp_time}s ({tf})")
         result = expert.Buy(
             amount=AMOUNT,
             type=eo_type,
             assetid=asset_id,
-            exptime=EXP_TIME,
+            exptime=exp_time,
             isdemo=1,
             strike_time=time.time()
         )
@@ -116,7 +120,9 @@ def execute_trade(asset_str, direction):
             "direction": direction,
             "type": eo_type,
             "asset_id": asset_id,
-            "amount": AMOUNT
+            "amount": AMOUNT,
+            "tf": tf,
+            "exp_seconds": exp_time
         }
 
     except Exception as e:
@@ -189,12 +195,13 @@ def trade():
 
     asset_str = data.get('asset', '')
     direction = data.get('direction', '').upper()
+    tf = data.get('tf', '5M')
 
     if direction not in ('BUY', 'SELL'):
         return jsonify({"status": "error", "message": f"Dirección inválida: {direction}"}), 400
 
-    print(f"[TRADE] ━━━ {asset_str} {direction} ━━━")
-    result = execute_trade(asset_str, direction)
+    print(f"[TRADE] ━━━ {asset_str} {direction} {tf} ━━━")
+    result = execute_trade(asset_str, direction, tf)
     print(f"[TRADE] ━━━ {result['status']} ━━━")
 
     code = 200 if result["status"] == "success" else 500
