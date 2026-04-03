@@ -70,122 +70,167 @@ SYMBOL_SEARCH = {
 TF_TO_EXP = {'5M': 300, '15M': 900, '30M': 1800, '1H': 3600}
 
 # ═══════════════════════════════════════════════════════════════════
-# DYNAMIC ASSET DISCOVERY
-# Cache de assets descubiertos del WS
+# RAW WS INTERCEPTOR — Captura mensajes crudos que la librería descarta
 # ═══════════════════════════════════════════════════════════════════
 
-DYNAMIC_ASSETS = {}       # {"BTC/USD": 160, ...} — actualizado por WS
-DYNAMIC_ASSETS_TS = 0     # timestamp de última actualización
-DYNAMIC_LOCK = threading.Lock()
+WS_RAW_DATA = {
+    'balance': None,
+    'assets': {},       # {asset_id: {name, symbol, isActive, ...}}
+    'profile': None,
+    'ready': False
+}
+WS_RAW_LOCK = threading.Lock()
 
-def capture_assets_from_ws(expert, timeout=6):
-    """Escucha mensajes WS por `timeout` segundos y extrae asset IDs activos."""
-    global DYNAMIC_ASSETS, DYNAMIC_ASSETS_TS
-    found = {}
+def inject_ws_interceptor(expert):
+    """
+    Monkey-patch el on_message del websocket_client de la librería.
+    Captura los mensajes JSON crudos ANTES de que la librería los descarte.
+    """
+    ws = getattr(expert, 'websocket_client', None)
+    if ws is None:
+        print("[WS-HOOK] ⚠️ websocket_client no encontrado")
+        return False
 
-    try:
-        # Buscar en msg_by_action
-        if hasattr(expert, 'msg_by_action') and isinstance(expert.msg_by_action, dict):
-            for key, val in expert.msg_by_action.items():
-                _extract_assets(val, found)
+    # Guardar callback original
+    original_on_message = ws.on_message
 
-        # Buscar assets como atributo directo
-        for attr_name in ['assets', 'instruments']:
-            if hasattr(expert, attr_name):
-                _extract_assets(getattr(expert, attr_name), found)
+    def intercepted_on_message(ws_app, message):
+        """Intercepta cada mensaje WS, extrae lo que necesitamos, luego pasa al original."""
+        try:
+            if isinstance(message, str):
+                data = json.loads(message)
+                action = data.get('action', '')
 
-    except Exception as e:
-        print(f"[ASSETS] ⚠️ Error extrayendo: {e}")
+                # Capturar profile (contiene demo_balance)
+                if action == 'profile':
+                    msg = data.get('message', data)
+                    with WS_RAW_LOCK:
+                        WS_RAW_DATA['profile'] = msg
+                        # Extraer balance
+                        if isinstance(msg, dict):
+                            for key in ['demo_balance', 'demoBalance', 'balance', 'd']:
+                                if key in msg:
+                                    try:
+                                        WS_RAW_DATA['balance'] = float(msg[key])
+                                    except (ValueError, TypeError):
+                                        pass
 
-    if found:
-        with DYNAMIC_LOCK:
-            DYNAMIC_ASSETS = found
-            DYNAMIC_ASSETS_TS = time.time()
-        print(f"[ASSETS] ✅ Dinámicos: {found}")
-    else:
-        print(f"[ASSETS] ⚠️ No se encontraron dinámicos, usando estáticos")
+                # Capturar assets
+                elif action == 'assets':
+                    msg = data.get('message', data)
+                    _parse_raw_assets(msg)
 
-def _extract_assets(data, found):
-    """Recursivamente extrae assets de estructuras de datos del WS."""
-    if data is None:
+                # Capturar multipleAction (contiene profile + assets dentro)
+                elif action == 'multipleAction':
+                    msg = data.get('message', data.get('data', []))
+                    if isinstance(msg, list):
+                        for sub in msg:
+                            if isinstance(sub, dict):
+                                sub_action = sub.get('action', '')
+                                if sub_action == 'profile':
+                                    sub_msg = sub.get('message', sub)
+                                    with WS_RAW_LOCK:
+                                        WS_RAW_DATA['profile'] = sub_msg
+                                        if isinstance(sub_msg, dict):
+                                            for key in ['demo_balance', 'demoBalance', 'balance']:
+                                                if key in sub_msg:
+                                                    try:
+                                                        WS_RAW_DATA['balance'] = float(sub_msg[key])
+                                                    except:
+                                                        pass
+                                elif sub_action == 'assets':
+                                    _parse_raw_assets(sub.get('message', sub))
+
+        except Exception:
+            pass  # Nunca romper el WS por un error de parsing
+
+        # Pasar al handler original de la librería
+        if original_on_message:
+            try:
+                original_on_message(ws_app, message)
+            except Exception:
+                pass
+
+    # Inyectar
+    ws.on_message = intercepted_on_message
+    print("[WS-HOOK] ✅ Interceptor inyectado")
+    return True
+
+def _parse_raw_assets(msg):
+    """Extrae assets de un mensaje crudo del WS."""
+    if msg is None:
         return
+    with WS_RAW_LOCK:
+        if isinstance(msg, list):
+            for item in msg:
+                if isinstance(item, dict) and 'id' in item:
+                    _index_asset(item)
+        elif isinstance(msg, dict):
+            # Puede ser {data: [...]} o directamente un asset
+            if 'data' in msg and isinstance(msg['data'], list):
+                for item in msg['data']:
+                    if isinstance(item, dict) and 'id' in item:
+                        _index_asset(item)
+            elif 'id' in msg:
+                _index_asset(msg)
 
-    # Si es una lista de assets
-    if isinstance(data, list):
-        for item in data:
-            if isinstance(item, dict):
-                _check_asset_dict(item, found)
-    # Si es un dict con assets dentro
-    elif isinstance(data, dict):
-        if 'id' in data and ('symbol' in data or '_name' in data or 'name' in data):
-            _check_asset_dict(data, found)
-        # Recurse into values
-        for v in data.values():
-            if isinstance(v, (list, dict)):
-                _extract_assets(v, found)
-
-def _check_asset_dict(item, found):
-    """Chequea si un dict es un asset y lo agrega al mapa."""
-    asset_id = item.get('id')
-    symbol = item.get('symbol', '').upper()
-    name = (item.get('_name', '') or item.get('name', '')).lower()
-    is_active = item.get('isActive', item.get('is_active', 0))
-
-    if not asset_id:
+def _index_asset(item):
+    """Indexa un asset individual en WS_RAW_DATA['assets']."""
+    aid = item.get('id')
+    if not aid:
         return
+    WS_RAW_DATA['assets'][int(aid)] = {
+        'name': item.get('_name', item.get('name', '')),
+        'symbol': item.get('symbol', ''),
+        'isActive': item.get('isActive', item.get('is_active', 0)),
+        'id': int(aid)
+    }
 
-    for our_name, search_terms in SYMBOL_SEARCH.items():
-        for term in search_terms:
-            if term.upper() in symbol or term.lower() in name:
-                # Preferir activos que están activos; si ya tenemos uno activo, no pisar con inactivo
-                if our_name in found and is_active != 1:
-                    continue
-                found[our_name] = int(asset_id)
-                break
+# ═══════════════════════════════════════════════════════════════════
+# ASSET RESOLVER — Usa datos interceptados del WS
+# ═══════════════════════════════════════════════════════════════════
 
 def resolve_asset_id(asset_str):
-    """Devuelve el ID del asset: primero dinámico, luego estático."""
-    with DYNAMIC_LOCK:
-        if asset_str in DYNAMIC_ASSETS:
-            return DYNAMIC_ASSETS[asset_str]
+    """
+    Busca el ID del activo en los datos crudos del WS.
+    Prioriza activos con isActive=1. Fallback a mapa estático.
+    """
+    search_terms = SYMBOL_SEARCH.get(asset_str, [])
+    if not search_terms:
+        return STATIC_ASSET_MAP.get(asset_str)
+
+    best_id = None
+    best_active = False
+
+    with WS_RAW_LOCK:
+        for aid, info in WS_RAW_DATA['assets'].items():
+            symbol = info.get('symbol', '').upper()
+            name = info.get('name', '').lower()
+            active = info.get('isActive') == 1
+
+            for term in search_terms:
+                if term.upper() in symbol or term.lower() in name:
+                    # Si encontramos uno activo, preferirlo
+                    if active and not best_active:
+                        best_id = aid
+                        best_active = True
+                    elif not best_id:
+                        best_id = aid
+                    break
+
+    if best_id:
+        return best_id
     return STATIC_ASSET_MAP.get(asset_str)
 
-# ═══════════════════════════════════════════════════════════════════
-# BALANCE READER
-# ═══════════════════════════════════════════════════════════════════
+def get_intercepted_balance():
+    """Lee el balance capturado por el interceptor WS."""
+    with WS_RAW_LOCK:
+        return WS_RAW_DATA['balance']
 
-def get_demo_balance(expert):
-    """Intenta obtener el saldo demo de múltiples fuentes."""
-    sources = [
-        # 1. Atributo profile (dict cacheado)
-        lambda: _dig_balance(getattr(expert, 'profile', None)),
-        # 2. msg_by_action.profile
-        lambda: _dig_balance((getattr(expert, 'msg_by_action', {}) or {}).get('profile')),
-        # 3. Método Profile()
-        lambda: _dig_balance(expert.Profile() if hasattr(expert, 'Profile') else None),
-    ]
-
-    for src in sources:
-        try:
-            bal = src()
-            if bal is not None and bal > 0:
-                return bal
-        except Exception:
-            continue
-    return None
-
-def _dig_balance(data):
-    """Extrae balance de un dict/objeto profile."""
-    if data is None:
-        return None
-    if isinstance(data, dict):
-        for key in ['demo_balance', 'demoBalance', 'balance', 'd']:
-            if key in data:
-                try:
-                    return float(data[key])
-                except (ValueError, TypeError):
-                    continue
-    return None
+def get_intercepted_asset_count():
+    """Cantidad de assets capturados."""
+    with WS_RAW_LOCK:
+        return len(WS_RAW_DATA['assets'])
 
 # ═══════════════════════════════════════════════════════════════════
 # ROBUST WS CONNECTION
@@ -247,9 +292,18 @@ def execute_trade(asset_str, direction, tf='5M'):
     max_retries = 3
     for attempt in range(max_retries):
         try:
+            # Reset raw data para esta conexión
+            with WS_RAW_LOCK:
+                WS_RAW_DATA['balance'] = None
+                WS_RAW_DATA['assets'] = {}
+                WS_RAW_DATA['profile'] = None
+
             print(f"[TRADE] 🔌 Conectando ({attempt + 1}/{max_retries})...")
             expert = EoApi(token=TOKEN, server_region=SERVER)
             expert.connect()
+
+            # Inyectar interceptor INMEDIATAMENTE después de connect
+            inject_ws_interceptor(expert)
 
             # Esperar WS listo
             ws_ok = wait_ws_ready(expert, timeout=12)
@@ -261,27 +315,21 @@ def execute_trade(asset_str, direction, tf='5M'):
             # SetDemo
             expert.SetDemo()
 
-            # ═══ POLLING ACTIVO: esperar hasta 5s a que lleguen datos del WS ═══
-            balance = None
+            # ═══ POLLING: esperar hasta 5s a que el interceptor capture datos ═══
             poll_start = time.time()
             poll_timeout = 5
+            balance = None
+            asset_count = 0
             while time.time() - poll_start < poll_timeout:
-                # Intentar capturar assets
-                if not DYNAMIC_ASSETS or time.time() - DYNAMIC_ASSETS_TS > 300:
-                    capture_assets_from_ws(expert)
+                balance = get_intercepted_balance()
+                asset_count = get_intercepted_asset_count()
 
-                # Intentar leer saldo
-                balance = get_demo_balance(expert)
-
-                # Salir si tenemos ambos
-                if balance is not None and balance > 0 and DYNAMIC_ASSETS:
-                    print(f"[TRADE] ✅ Datos listos en {time.time() - poll_start:.1f}s (saldo: ${balance:.0f}, assets: {len(DYNAMIC_ASSETS)})")
+                if balance is not None and balance > 0 and asset_count > 0:
+                    print(f"[TRADE] ✅ Datos WS en {time.time() - poll_start:.1f}s (saldo: ${balance:.0f}, assets: {asset_count})")
                     break
-
                 time.sleep(0.5)
             else:
-                elapsed = time.time() - poll_start
-                print(f"[TRADE] ⚠️ Polling agotado ({elapsed:.1f}s) — balance: {balance}, dynamic: {len(DYNAMIC_ASSETS)}")
+                print(f"[TRADE] ⚠️ Polling {time.time() - poll_start:.1f}s — balance: {balance}, assets: {asset_count}")
 
             # Resolver asset ID (dinámico > estático)
             asset_id = resolve_asset_id(asset_str)
@@ -362,20 +410,21 @@ def check_auth():
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({"status": "ok", "mode": "LAZY_v2", "eoapi": EoApi is not None}), 200
+    return jsonify({"status": "ok", "mode": "LAZY_v3", "eoapi": EoApi is not None}), 200
 
 @app.route('/broker-status', methods=['GET'])
 def broker_status():
     if not check_auth():
         return jsonify({"status": "error", "message": "No autorizado"}), 401
-    with DYNAMIC_LOCK:
-        dyn = dict(DYNAMIC_ASSETS) if DYNAMIC_ASSETS else None
+    with WS_RAW_LOCK:
+        asset_count = len(WS_RAW_DATA['assets'])
+        balance = WS_RAW_DATA['balance']
     return jsonify({
         "connected": bool(EoApi and TOKEN),
-        "mode": "LAZY_v2",
+        "mode": "LAZY_v3_interceptor",
         "static_assets": list(STATIC_ASSET_MAP.keys()),
-        "dynamic_assets": dyn,
-        "dynamic_age_s": int(time.time() - DYNAMIC_ASSETS_TS) if DYNAMIC_ASSETS_TS else None
+        "ws_assets_captured": asset_count,
+        "ws_balance": balance
     }), 200
 
 @app.route('/trade', methods=['POST'])
@@ -405,7 +454,7 @@ def trade():
 # STARTUP
 # ═══════════════════════════════════════════════════════════════════
 
-print(f"[BRIDGE] LAZY v2 | EoApi: {'OK' if EoApi else 'NO'} | Token: {'OK' if TOKEN else 'NO'}")
+print(f"[BRIDGE] LAZY v3 + WS Interceptor | EoApi: {'OK' if EoApi else 'NO'} | Token: {'OK' if TOKEN else 'NO'}")
 print(f"[BRIDGE] Assets estáticos: {list(STATIC_ASSET_MAP.keys())}")
 
 if __name__ == '__main__':
