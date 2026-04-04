@@ -352,23 +352,37 @@ def execute_trade(asset_str, direction, tf='5M'):
     else:
         print(f"[TRADE] ⚠️ Saldo no disponible → fijo ${trade_amount}")
 
-    # EJECUTAR — directo, sin ThreadPoolExecutor
+    # EJECUTAR — con 1 retry si falla por conexión muerta
     print(f"[TRADE] 🎯 {eo_type.upper()} {asset_str} (ID:{asset_id}) ${trade_amount} exp:{exp_time}s ({tf})")
-    try:
-        result = expert.Buy(
-            amount=trade_amount,
-            type=eo_type,
-            assetid=asset_id,
-            exptime=exp_time,
-            isdemo=1,
-            strike_time=time.time()
-        )
-        print(f"[TRADE] ✅ Respuesta: {result}")
-    except Exception as e:
-        print(f"[TRADE] ❌ Error en Buy(): {e}")
-        # Marcar conexión como muerta para reconectar en próximo trade
-        expert = None
-        return {"status": "error", "message": str(e)}
+    for buy_attempt in range(2):
+        try:
+            result = expert.Buy(
+                amount=trade_amount,
+                type=eo_type,
+                assetid=asset_id,
+                exptime=exp_time,
+                isdemo=1,
+                strike_time=time.time()
+            )
+            print(f"[TRADE] ✅ Respuesta: {result}")
+            # --- EL PARCHE ANTI-MENTIRAS ---
+            if result is None:
+                return {"status": "error", "message": "El Broker rechazó la orden (Probable inactivo/OTC)"}
+            # -------------------------------
+            break
+        except Exception as e:
+            print(f"[TRADE] ❌ Buy() falló: {e}")
+            if buy_attempt == 0:
+                # Reconectar y reintentar
+                print(f"[TRADE] 🔄 Reconectando para retry...")
+                expert = None
+                with expert_lock:
+                    if connect_global():
+                        continue
+                return {"status": "error", "message": f"Reconexión fallida: {e}"}
+            else:
+                expert = None
+                return {"status": "error", "message": str(e)}
 
     # GC periódico (cada 10 trades)
     GC_COUNTER += 1
