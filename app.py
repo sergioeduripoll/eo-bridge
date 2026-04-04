@@ -1,12 +1,17 @@
 """
-app.py — Puente ExpertOption LAZY v2
-Fixes: Dynamic asset mapping, balance reading, robust WS, silent logs
+app.py — Puente ExpertOption v4 — Conexión Global Persistente
+- UNA sola instancia global de EoApi conectada al arrancar
+- WS Interceptor inyectado una vez, mantiene WS_RAW_DATA en segundo plano
+- /trade NO crea instancias nuevas, usa la global
+- gc.collect() periódico para limpiar basura
+- Sin ThreadPoolExecutor (evita bloquear workers de Flask)
 """
 
 import os
 import sys
 import time
 import json
+import gc
 import threading
 import subprocess
 
@@ -50,13 +55,11 @@ SERVER = os.environ.get("EO_SERVER", "wss://fr24g1eu.expertoption.com/")
 API_SECRET = os.environ.get("BRIDGE_SECRET", "cambiar_esto")
 AMOUNT = int(os.environ.get("TRADE_AMOUNT", "10"))
 
-# Fallback estático — se usa SOLO si el mapeo dinámico falla
 STATIC_ASSET_MAP = {
     "BTC/USD":  160, "ETH/USD":  162, "XRP/USD":  173,
     "ADA/USD":  235, "SOL/USD":  464, "DOGE/USD": 463, "BNB/USD":  462
 }
 
-# Símbolos para buscar en assets dinámicos
 SYMBOL_SEARCH = {
     "BTC/USD":  ["BTCUSD", "btcusd", "bitcoin"],
     "ETH/USD":  ["ETHUSD", "ethusd", "ethereum"],
@@ -70,43 +73,39 @@ SYMBOL_SEARCH = {
 TF_TO_EXP = {'5M': 300, '15M': 900, '30M': 1800, '1H': 3600}
 
 # ═══════════════════════════════════════════════════════════════════
-# RAW WS INTERCEPTOR — Captura mensajes crudos que la librería descarta
+# WS RAW DATA — Actualizado en segundo plano por el interceptor
 # ═══════════════════════════════════════════════════════════════════
 
 WS_RAW_DATA = {
     'balance': None,
-    'assets': {},       # {asset_id: {name, symbol, isActive, ...}}
+    'assets': {},
     'profile': None,
-    'ready': False
 }
 WS_RAW_LOCK = threading.Lock()
 
+# ═══════════════════════════════════════════════════════════════════
+# WS INTERCEPTOR — Se inyecta UNA VEZ en la conexión global
+# ═══════════════════════════════════════════════════════════════════
+
 def inject_ws_interceptor(expert):
-    """
-    Monkey-patch el on_message del websocket_client de la librería.
-    Captura los mensajes JSON crudos ANTES de que la librería los descarte.
-    """
+    """Monkey-patch on_message para capturar datos crudos del WS."""
     ws = getattr(expert, 'websocket_client', None)
     if ws is None:
         print("[WS-HOOK] ⚠️ websocket_client no encontrado")
         return False
 
-    # Guardar callback original
     original_on_message = ws.on_message
 
     def intercepted_on_message(ws_app, message):
-        """Intercepta cada mensaje WS, extrae lo que necesitamos, luego pasa al original."""
         try:
             if isinstance(message, str):
                 data = json.loads(message)
                 action = data.get('action', '')
 
-                # Capturar profile (contiene demo_balance)
                 if action == 'profile':
                     msg = data.get('message', data)
                     with WS_RAW_LOCK:
                         WS_RAW_DATA['profile'] = msg
-                        # Extraer balance
                         if isinstance(msg, dict):
                             for key in ['demo_balance', 'demoBalance', 'balance', 'd']:
                                 if key in msg:
@@ -115,12 +114,10 @@ def inject_ws_interceptor(expert):
                                     except (ValueError, TypeError):
                                         pass
 
-                # Capturar assets
                 elif action == 'assets':
                     msg = data.get('message', data)
                     _parse_raw_assets(msg)
 
-                # Capturar multipleAction (contiene profile + assets dentro)
                 elif action == 'multipleAction':
                     msg = data.get('message', data.get('data', []))
                     if isinstance(msg, list):
@@ -140,24 +137,20 @@ def inject_ws_interceptor(expert):
                                                         pass
                                 elif sub_action == 'assets':
                                     _parse_raw_assets(sub.get('message', sub))
-
         except Exception:
-            pass  # Nunca romper el WS por un error de parsing
+            pass
 
-        # Pasar al handler original de la librería
         if original_on_message:
             try:
                 original_on_message(ws_app, message)
             except Exception:
                 pass
 
-    # Inyectar
     ws.on_message = intercepted_on_message
-    print("[WS-HOOK] ✅ Interceptor inyectado")
+    print("[WS-HOOK] ✅ Interceptor inyectado en conexión global")
     return True
 
 def _parse_raw_assets(msg):
-    """Extrae assets de un mensaje crudo del WS."""
     if msg is None:
         return
     with WS_RAW_LOCK:
@@ -166,7 +159,6 @@ def _parse_raw_assets(msg):
                 if isinstance(item, dict) and 'id' in item:
                     _index_asset(item)
         elif isinstance(msg, dict):
-            # Puede ser {data: [...]} o directamente un asset
             if 'data' in msg and isinstance(msg['data'], list):
                 for item in msg['data']:
                     if isinstance(item, dict) and 'id' in item:
@@ -175,7 +167,6 @@ def _parse_raw_assets(msg):
                 _index_asset(msg)
 
 def _index_asset(item):
-    """Indexa un asset individual en WS_RAW_DATA['assets']."""
     aid = item.get('id')
     if not aid:
         return
@@ -187,14 +178,10 @@ def _index_asset(item):
     }
 
 # ═══════════════════════════════════════════════════════════════════
-# ASSET RESOLVER — Usa datos interceptados del WS
+# ASSET RESOLVER
 # ═══════════════════════════════════════════════════════════════════
 
 def resolve_asset_id(asset_str):
-    """
-    Busca el ID del activo en los datos crudos del WS.
-    Prioriza activos con isActive=1. Fallback a mapa estático.
-    """
     search_terms = SYMBOL_SEARCH.get(asset_str, [])
     if not search_terms:
         return STATIC_ASSET_MAP.get(asset_str)
@@ -210,7 +197,6 @@ def resolve_asset_id(asset_str):
 
             for term in search_terms:
                 if term.upper() in symbol or term.lower() in name:
-                    # Si encontramos uno activo, preferirlo
                     if active and not best_active:
                         best_id = aid
                         best_active = True
@@ -222,50 +208,26 @@ def resolve_asset_id(asset_str):
         return best_id
     return STATIC_ASSET_MAP.get(asset_str)
 
-def get_intercepted_balance():
-    """Lee el balance capturado por el interceptor WS."""
-    with WS_RAW_LOCK:
-        return WS_RAW_DATA['balance']
-
-def get_intercepted_asset_count():
-    """Cantidad de assets capturados."""
-    with WS_RAW_LOCK:
-        return len(WS_RAW_DATA['assets'])
-
 # ═══════════════════════════════════════════════════════════════════
-# ROBUST WS CONNECTION
+# CONEXIÓN GLOBAL PERSISTENTE
 # ═══════════════════════════════════════════════════════════════════
 
-def kill_expert(expert):
-    """Cierre agresivo de conexión y hilos."""
+expert = None          # Instancia global única
+expert_lock = threading.Lock()
+GC_COUNTER = 0         # Contador para gc.collect() periódico
+
+def is_ws_alive():
+    """Verifica si el WebSocket global sigue vivo."""
+    global expert
     if expert is None:
-        return
+        return False
     try:
         ws = getattr(expert, 'websocket_client', None)
-        if ws:
-            ws.close()
+        if ws and hasattr(ws, 'sock') and ws.sock and ws.sock.connected:
+            return True
     except Exception:
         pass
-    for attr in ['websocket_thread', 'ping_thread']:
-        try:
-            t = getattr(expert, attr, None)
-            if t and hasattr(t, 'is_alive') and t.is_alive():
-                t.join(timeout=2)
-        except Exception:
-            pass
-
-def wait_ws_ready(expert, timeout=12):
-    """Espera que el WS esté conectado verificando sock.connected."""
-    start = time.time()
-    while time.time() - start < timeout:
-        try:
-            ws = getattr(expert, 'websocket_client', None)
-            if ws and hasattr(ws, 'sock') and ws.sock and ws.sock.connected:
-                return True
-        except Exception:
-            pass
-        time.sleep(0.3)
-    # Fallback: si hay msg_by_action con datos, probablemente está conectado
+    # Fallback: chequear msg_by_action
     try:
         mba = getattr(expert, 'msg_by_action', None)
         if mba and len(mba) > 0:
@@ -274,12 +236,94 @@ def wait_ws_ready(expert, timeout=12):
         pass
     return False
 
+def connect_global():
+    """Conecta la instancia global y inyecta el interceptor UNA VEZ."""
+    global expert
+    if EoApi is None:
+        print("[GLOBAL] ❌ EoApi no disponible")
+        return False
+    if not TOKEN:
+        print("[GLOBAL] ❌ EO_TOKEN no configurado")
+        return False
+
+    try:
+        # Matar instancia anterior si existe
+        if expert is not None:
+            try:
+                ws = getattr(expert, 'websocket_client', None)
+                if ws:
+                    ws.close()
+            except Exception:
+                pass
+            expert = None
+            gc.collect()
+
+        print("[GLOBAL] 🔌 Conectando a ExpertOption...")
+        expert = EoApi(token=TOKEN, server_region=SERVER)
+        expert.connect()
+
+        # Esperar WS listo
+        start = time.time()
+        while time.time() - start < 12:
+            try:
+                ws = getattr(expert, 'websocket_client', None)
+                if ws and hasattr(ws, 'sock') and ws.sock and ws.sock.connected:
+                    break
+            except Exception:
+                pass
+            time.sleep(0.3)
+
+        # Inyectar interceptor UNA VEZ
+        inject_ws_interceptor(expert)
+
+        # SetDemo
+        expert.SetDemo()
+
+        # Pedir datos activamente
+        try:
+            ws_sock = getattr(expert.websocket_client, 'sock', None)
+            if ws_sock and ws_sock.connected:
+                ws_sock.send(json.dumps({"action": "profile"}))
+                ws_sock.send(json.dumps({"action": "assets"}))
+        except Exception:
+            pass
+
+        # Esperar datos del interceptor (hasta 5s)
+        poll_start = time.time()
+        while time.time() - poll_start < 5:
+            with WS_RAW_LOCK:
+                bal = WS_RAW_DATA['balance']
+                ac = len(WS_RAW_DATA['assets'])
+            if bal is not None and bal > 0:
+                print(f"[GLOBAL] ✅ Conectado | Saldo: ${bal:.0f} | Assets: {ac}")
+                return True
+            time.sleep(0.5)
+
+        print(f"[GLOBAL] ✅ Conectado (sin datos WS aún, usará fallback)")
+        return True
+
+    except Exception as e:
+        print(f"[GLOBAL] ❌ Error: {e}")
+        expert = None
+        return False
+
+def ensure_connection():
+    """Verifica conexión global, reconecta si es necesario."""
+    global expert
+    with expert_lock:
+        if is_ws_alive():
+            return True
+        print("[GLOBAL] 🔄 Reconectando...")
+        return connect_global()
+
 # ═══════════════════════════════════════════════════════════════════
-# TRADE EXECUTION — LAZY MODE
+# TRADE EXECUTION — Usa conexión global, NO crea instancias nuevas
 # ═══════════════════════════════════════════════════════════════════
 
 def execute_trade(asset_str, direction, tf='5M'):
-    """Conecta → Descubre assets → Lee saldo → Opera → Desconecta."""
+    """Usa la conexión global para ejecutar el trade."""
+    global expert, GC_COUNTER
+
     if EoApi is None:
         return {"status": "error", "message": "EoApi no cargado"}
     if not TOKEN:
@@ -288,127 +332,85 @@ def execute_trade(asset_str, direction, tf='5M'):
     eo_type = "call" if direction == "BUY" else "put"
     exp_time = TF_TO_EXP.get(tf, 300)
 
-    expert = None
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            # Reset raw data para esta conexión
-            with WS_RAW_LOCK:
-                WS_RAW_DATA['balance'] = None
-                WS_RAW_DATA['assets'] = {}
-                WS_RAW_DATA['profile'] = None
+    # Asegurar conexión global
+    if not ensure_connection():
+        return {"status": "error", "message": "No se pudo conectar a ExpertOption"}
 
-            print(f"[TRADE] 🔌 Conectando ({attempt + 1}/{max_retries})...")
-            expert = EoApi(token=TOKEN, server_region=SERVER)
-            expert.connect()
+    # Resolver asset ID (dinámico > estático)
+    asset_id = resolve_asset_id(asset_str)
+    if asset_id is None:
+        return {"status": "error", "message": f"Activo no mapeado: {asset_str}"}
 
-            # Inyectar interceptor INMEDIATAMENTE después de connect
-            inject_ws_interceptor(expert)
+    # Leer saldo del interceptor
+    with WS_RAW_LOCK:
+        balance = WS_RAW_DATA['balance']
 
-            # Esperar WS listo
-            ws_ok = wait_ws_ready(expert, timeout=12)
-            if ws_ok:
-                print(f"[TRADE] ✅ WS conectado")
-            else:
-                raise Exception("WebSocket no se conectó en 12s")
+    trade_amount = AMOUNT
+    if balance is not None and balance > 0:
+        trade_amount = max(1, int(balance * 0.10))
+        print(f"[TRADE] 💰 Saldo: ${balance:.0f} → 10% = ${trade_amount}")
+    else:
+        print(f"[TRADE] ⚠️ Saldo no disponible → fijo ${trade_amount}")
 
-            # SetDemo
-            expert.SetDemo()
+    # EJECUTAR — directo, sin ThreadPoolExecutor
+    print(f"[TRADE] 🎯 {eo_type.upper()} {asset_str} (ID:{asset_id}) ${trade_amount} exp:{exp_time}s ({tf})")
+    try:
+        result = expert.Buy(
+            amount=trade_amount,
+            type=eo_type,
+            assetid=asset_id,
+            exptime=exp_time,
+            isdemo=1,
+            strike_time=time.time()
+        )
+        print(f"[TRADE] ✅ Respuesta: {result}")
+    except Exception as e:
+        print(f"[TRADE] ❌ Error en Buy(): {e}")
+        # Marcar conexión como muerta para reconectar en próximo trade
+        expert = None
+        return {"status": "error", "message": str(e)}
 
-            print("[TRADE] 📡 Pidiendo datos al broker...")
-            try:
-                ws_sock = getattr(expert.websocket_client, 'sock', None)
-                if ws_sock and ws_sock.connected:
-                    ws_sock.send(json.dumps({"action": "profile"}))
-                    ws_sock.send(json.dumps({"action": "assets"}))
-            except Exception as e:
-                print(f"[WS] Error pidiendo datos: {e}")
+    # GC periódico (cada 10 trades)
+    GC_COUNTER += 1
+    if GC_COUNTER % 10 == 0:
+        collected = gc.collect()
+        if collected > 0:
+            print(f"[GC] Limpiados {collected} objetos")
 
-            # ═══ POLLING: esperar hasta 5s a que el interceptor capture datos ═══
-            poll_start = time.time()
-            poll_timeout = 5
-            balance = None
-            asset_count = 0
-            while time.time() - poll_start < poll_timeout:
-                balance = get_intercepted_balance()
-                asset_count = get_intercepted_asset_count()
-
-                if balance is not None and balance > 0 and asset_count > 0:
-                    print(f"[TRADE] ✅ Datos WS en {time.time() - poll_start:.1f}s (saldo: ${balance:.0f}, assets: {asset_count})")
-                    break
-                time.sleep(0.5)
-            else:
-                print(f"[TRADE] ⚠️ Polling {time.time() - poll_start:.1f}s — balance: {balance}, assets: {asset_count}")
-
-            # Resolver asset ID (dinámico > estático)
-            asset_id = resolve_asset_id(asset_str)
-            if asset_id is None:
-                kill_expert(expert)
-                return {"status": "error", "message": f"Activo no mapeado: {asset_str}"}
-
-            # Calcular monto: 10% del saldo (entero, mín 1) o fallback fijo
-            trade_amount = AMOUNT
-            if balance is not None and balance > 0:
-                trade_amount = max(1, int(balance * 0.10))
-                print(f"[TRADE] 💰 Saldo: ${balance:.0f} → 10% = ${trade_amount}")
-            else:
-                print(f"[TRADE] ⚠️ Saldo no disponible → fijo ${trade_amount}")
-
-            import concurrent.futures
-
-            # EJECUTAR
-            print(f"[TRADE] 🎯 {eo_type.upper()} {asset_str} (ID:{asset_id}) ${trade_amount} exp:{exp_time}s ({tf})")
-
-            def safe_buy():
-                return expert.Buy(amount=trade_amount, type=eo_type, assetid=asset_id, exptime=exp_time, isdemo=1, strike_time=time.time())
-
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                future = executor.submit(safe_buy)
-                try:
-                    result = future.result(timeout=8)
-                    print(f"[TRADE] ✅ Respuesta: {result}")
-                except concurrent.futures.TimeoutError:
-                    print("[TRADE] ⚠️ El broker no confirmó (Timeout 8s). Probable ERROR_INACTIVE_ASSET.")
-                    result = {"status": "error", "message": "Broker timeout - Asset inactivo o WS colgado"}
-
-            kill_expert(expert)
-            expert = None
-
-            return {
-                "status": "success", "asset": asset_str, "direction": direction,
-                "type": eo_type, "asset_id": asset_id, "amount": trade_amount,
-                "tf": tf, "exp_seconds": exp_time
-            }
-
-        except Exception as e:
-            print(f"[TRADE] ❌ Intento {attempt + 1}: {e}")
-            kill_expert(expert)
-            expert = None
-
-            if attempt < max_retries - 1:
-                wait = 3 + (attempt * 3)  # 3s, 6s
-                print(f"[TRADE] 🔄 Retry en {wait}s...")
-                time.sleep(wait)
-            else:
-                return {"status": "error", "message": str(e)}
+    return {
+        "status": "success", "asset": asset_str, "direction": direction,
+        "type": eo_type, "asset_id": asset_id, "amount": trade_amount,
+        "tf": tf, "exp_seconds": exp_time
+    }
 
 # ═══════════════════════════════════════════════════════════════════
-# KEEP-ALIVE — SILENCIOSO
+# KEEP-ALIVE + WATCHDOG — Silencioso, verifica conexión global
 # ═══════════════════════════════════════════════════════════════════
 
-def keep_alive():
+def keep_alive_watchdog():
     import urllib.request
     render_url = os.environ.get("RENDER_EXTERNAL_URL", "")
+    gc_cycle = 0
     while True:
-        time.sleep(600)
+        time.sleep(600)  # 10 min
+        # Ping HTTP para que Render no duerma
         if render_url:
             try:
                 urllib.request.urlopen(f"{render_url}/health", timeout=10)
-                # SILENCIOSO — no printear cada 10 min
             except Exception:
                 pass
+        # Verificar conexión global (reconectar si cayó)
+        if not is_ws_alive():
+            with expert_lock:
+                connect_global()
+        # GC periódico
+        gc_cycle += 1
+        if gc_cycle % 3 == 0:  # Cada 30 min
+            collected = gc.collect()
+            if collected > 0:
+                print(f"[GC] Watchdog: limpiados {collected} objetos")
 
-threading.Thread(target=keep_alive, daemon=True).start()
+threading.Thread(target=keep_alive_watchdog, daemon=True).start()
 
 # ═══════════════════════════════════════════════════════════════════
 # AUTH
@@ -424,7 +426,12 @@ def check_auth():
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({"status": "ok", "mode": "LAZY_v3", "eoapi": EoApi is not None}), 200
+    return jsonify({
+        "status": "ok",
+        "mode": "GLOBAL_v4",
+        "eoapi": EoApi is not None,
+        "ws_alive": is_ws_alive()
+    }), 200
 
 @app.route('/broker-status', methods=['GET'])
 def broker_status():
@@ -434,11 +441,11 @@ def broker_status():
         asset_count = len(WS_RAW_DATA['assets'])
         balance = WS_RAW_DATA['balance']
     return jsonify({
-        "connected": bool(EoApi and TOKEN),
-        "mode": "LAZY_v3_interceptor",
-        "static_assets": list(STATIC_ASSET_MAP.keys()),
+        "connected": is_ws_alive(),
+        "mode": "GLOBAL_v4",
+        "ws_balance": balance,
         "ws_assets_captured": asset_count,
-        "ws_balance": balance
+        "static_assets": list(STATIC_ASSET_MAP.keys())
     }), 200
 
 @app.route('/trade', methods=['POST'])
@@ -465,11 +472,17 @@ def trade():
     return jsonify(result), code
 
 # ═══════════════════════════════════════════════════════════════════
-# STARTUP
+# STARTUP — Conectar la instancia global al arrancar
 # ═══════════════════════════════════════════════════════════════════
 
-print(f"[BRIDGE] LAZY v3 + WS Interceptor | EoApi: {'OK' if EoApi else 'NO'} | Token: {'OK' if TOKEN else 'NO'}")
+print(f"[BRIDGE] GLOBAL v4 | EoApi: {'OK' if EoApi else 'NO'} | Token: {'OK' if TOKEN else 'NO'}")
 print(f"[BRIDGE] Assets estáticos: {list(STATIC_ASSET_MAP.keys())}")
+
+# Conectar al arrancar
+if EoApi and TOKEN:
+    connect_global()
+else:
+    print("[BRIDGE] ⚠️ No se conecta al arrancar (falta EoApi o Token)")
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 8080))
