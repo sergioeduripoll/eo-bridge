@@ -315,6 +315,15 @@ def execute_trade(asset_str, direction, tf='5M'):
             # SetDemo
             expert.SetDemo()
 
+            print("[TRADE] 📡 Pidiendo datos al broker...")
+            try:
+                ws_sock = getattr(expert.websocket_client, 'sock', None)
+                if ws_sock and ws_sock.connected:
+                    ws_sock.send(json.dumps({"action": "profile"}))
+                    ws_sock.send(json.dumps({"action": "assets"}))
+            except Exception as e:
+                print(f"[WS] Error pidiendo datos: {e}")
+
             # ═══ POLLING: esperar hasta 5s a que el interceptor capture datos ═══
             poll_start = time.time()
             poll_timeout = 5
@@ -345,17 +354,22 @@ def execute_trade(asset_str, direction, tf='5M'):
             else:
                 print(f"[TRADE] ⚠️ Saldo no disponible → fijo ${trade_amount}")
 
+            import concurrent.futures
+
             # EJECUTAR
             print(f"[TRADE] 🎯 {eo_type.upper()} {asset_str} (ID:{asset_id}) ${trade_amount} exp:{exp_time}s ({tf})")
-            result = expert.Buy(
-                amount=trade_amount,
-                type=eo_type,
-                assetid=asset_id,
-                exptime=exp_time,
-                isdemo=1,
-                strike_time=time.time()
-            )
-            print(f"[TRADE] ✅ Respuesta: {result}")
+
+            def safe_buy():
+                return expert.Buy(amount=trade_amount, type=eo_type, assetid=asset_id, exptime=exp_time, isdemo=1, strike_time=time.time())
+
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(safe_buy)
+                try:
+                    result = future.result(timeout=8)
+                    print(f"[TRADE] ✅ Respuesta: {result}")
+                except concurrent.futures.TimeoutError:
+                    print("[TRADE] ⚠️ El broker no confirmó (Timeout 8s). Probable ERROR_INACTIVE_ASSET.")
+                    result = {"status": "error", "message": "Broker timeout - Asset inactivo o WS colgado"}
 
             kill_expert(expert)
             expert = None
