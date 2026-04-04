@@ -352,39 +352,51 @@ def execute_trade(asset_str, direction, tf='5M'):
     else:
         print(f"[TRADE] ⚠️ Saldo no disponible → fijo ${trade_amount}")
 
-    # EJECUTAR — con 1 retry si falla por conexión muerta
+    # EJECUTAR — con timeout de 8s y anti-mentiras
+    import concurrent.futures
+    
     print(f"[TRADE] 🎯 {eo_type.upper()} {asset_str} (ID:{asset_id}) ${trade_amount} exp:{exp_time}s ({tf})")
+    
+    def safe_buy():
+        return expert.Buy(amount=trade_amount, type=eo_type, assetid=asset_id, exptime=exp_time, isdemo=1, strike_time=time.time())
+
     for buy_attempt in range(2):
-        try:
-            result = expert.Buy(
-                amount=trade_amount,
-                type=eo_type,
-                assetid=asset_id,
-                exptime=exp_time,
-                isdemo=1,
-                strike_time=time.time()
-            )
-            print(f"[TRADE] ✅ Respuesta: {result}")
-            # --- EL PARCHE ANTI-MENTIRAS ---
-            if result is None:
-                return {"status": "error", "message": "El Broker rechazó la orden (Probable inactivo/OTC)"}
-            # -------------------------------
-            break
-        except Exception as e:
-            print(f"[TRADE] ❌ Buy() falló: {e}")
-            if buy_attempt == 0:
-                # Reconectar y reintentar
-                print(f"[TRADE] 🔄 Reconectando para retry...")
-                expert = None
-                with expert_lock:
-                    if connect_global():
-                        continue
-                return {"status": "error", "message": f"Reconexión fallida: {e}"}
-            else:
-                expert = None
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            future = executor.submit(safe_buy)
+            try:
+                result = future.result(timeout=8)
+                print(f"[TRADE] ✅ Respuesta cruda: {result}")
+                
+                # --- EL PARCHE ANTI-MENTIRAS ---
+                if result is None or result is False:
+                    print("[TRADE] ⚠️ El broker devolvió None/False. El activo probablemente está cerrado/OTC.")
+                    return {"status": "error", "message": "Activo inactivo en ExpertOption"}
+                # -------------------------------
+                
+                break # Si salió todo bien, rompe el bucle de reintentos
+                
+            except concurrent.futures.TimeoutError:
+                print("[TRADE] ❌ Timeout 8s esperando al broker.")
+                if buy_attempt == 0:
+                    print("[TRADE] 🔄 Reintentando...")
+                    # Forzamos reconexión si hubo timeout
+                    expert = None
+                    with expert_lock:
+                        connect_global()
+                    continue
+                return {"status": "error", "message": "Timeout del Broker"}
+            except Exception as e:
+                print(f"[TRADE] ❌ Error en Buy(): {e}")
+                # Si es el famoso error del cable cortado, lo enchufamos de nuevo
+                if buy_attempt == 0 and "Broken pipe" in str(e):
+                    print("[TRADE] 🔄 Broken pipe detectado. Reconectando...")
+                    expert = None
+                    with expert_lock:
+                        connect_global()
+                    continue
                 return {"status": "error", "message": str(e)}
 
-    # GC periódico (cada 10 trades)
+    # Limpiamos basura de RAM (El Mata-Zombies)
     GC_COUNTER += 1
     if GC_COUNTER % 10 == 0:
         collected = gc.collect()
@@ -396,7 +408,6 @@ def execute_trade(asset_str, direction, tf='5M'):
         "type": eo_type, "asset_id": asset_id, "amount": trade_amount,
         "tf": tf, "exp_seconds": exp_time
     }
-
 # ═══════════════════════════════════════════════════════════════════
 # KEEP-ALIVE + WATCHDOG — Silencioso, verifica conexión global
 # ═══════════════════════════════════════════════════════════════════
