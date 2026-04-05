@@ -276,8 +276,8 @@ def connect_global():
         # Inyectar interceptor UNA VEZ
         inject_ws_interceptor(expert)
 
-        # SetDemo
-        expert.SetDemo()
+        # SetReal
+        expert.SetReal()
 
         # Pedir datos activamente
         try:
@@ -345,12 +345,14 @@ def execute_trade(asset_str, direction, tf='5M'):
     with WS_RAW_LOCK:
         balance = WS_RAW_DATA['balance']
 
-    trade_amount = AMOUNT
-    if balance is not None and balance > 0:
-        trade_amount = max(1, int(balance * 0.10))
-        print(f"[TRADE] 💰 Saldo: ${balance:.0f} → 10% = ${trade_amount}")
+        # MONTO FIJO PARA CUENTA REAL
+    trade_amount = 1  # 👈 ACÁ EDITÁS EL MONTO FÁCILMENTE ($1)
+    
+    if balance is not None:
+        print(f"[TRADE] 💰 Saldo actual: ${balance:.0f} | Operando monto fijo: ${trade_amount}")
     else:
-        print(f"[TRADE] ⚠️ Saldo no disponible → fijo ${trade_amount}")
+        print(f"[TRADE] ⚠️ Saldo no visible | Operando monto fijo: ${trade_amount}")
+
 
     # EJECUTAR — con timeout de 8s y anti-mentiras
     import concurrent.futures
