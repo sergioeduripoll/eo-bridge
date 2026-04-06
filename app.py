@@ -345,40 +345,18 @@ def debug():
     info = {"ws_alive":_alive(),"has_expert":expert is not None,"initialized":_initialized}
     if expert:
         try:
-            store = getattr(expert, 'msg_by_action', {})
-            info["msg_keys"] = list(store.keys()) if store else []
-            
-            # Buscar profile en multipleAction
-            ma = store.get('multipleAction')
-            if ma:
-                info["multipleAction_type"] = str(type(ma).__name__)
-                if isinstance(ma, dict):
-                    info["multipleAction_keys"] = list(ma.keys())[:20]
-                    # Buscar profile dentro
-                    for k, v in ma.items():
-                        if 'profile' in str(k).lower() or 'balance' in str(k).lower():
-                            info[f"ma_{k}"] = str(v)[:500]
-                elif isinstance(ma, list):
-                    info["multipleAction_len"] = len(ma)
-                    # Buscar profile en items
-                    for i, item in enumerate(ma[:10]):
-                        if isinstance(item, dict):
-                            if 'profile' in item or item.get('action') == 'profile':
-                                info[f"ma_item_{i}"] = str(item)[:500]
-                else:
-                    info["multipleAction_raw"] = str(ma)[:500]
-            
-            # Buscar balance en TODOS los atributos del expert
-            for attr_name in dir(expert):
-                if attr_name.startswith('_'): continue
+            # Dump ALL non-callable attributes
+            attrs = {}
+            for name in dir(expert):
+                if name.startswith('__'): continue
                 try:
-                    val = getattr(expert, attr_name)
+                    val = getattr(expert, name)
                     if callable(val): continue
-                    val_str = str(val)
-                    if 'balance' in val_str.lower() or 'demo_balance' in val_str.lower() or '3.08' in val_str or '13698.50' in val_str:
-                        info[f"attr_{attr_name}"] = val_str[:500]
+                    s = str(val)
+                    if len(s) > 300: s = s[:300] + '...'
+                    attrs[name] = s
                 except: pass
-            
+            info["all_attrs"] = attrs
             info["threads"] = [t.name for t in threading.enumerate()]
         except Exception as e:
             info["error"] = str(e)
