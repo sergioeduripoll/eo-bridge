@@ -6,6 +6,7 @@ app.py — Puente ExpertOption v4 — Conexión Global Persistente (Optimizado)
 - gc.collect() periódico optimizado (cada 20 ciclos)
 - Sin ThreadPoolExecutor para evitar fugas de memoria y OOM en Render
 - Logs controlados por ENV para evitar saturación de disco
+- Fix WS: Manejo limpio de acciones (candles, pong, tradersChoice)
 """
 
 import os
@@ -14,6 +15,13 @@ import time
 import json
 import gc
 import threading
+import signal
+
+class TimeoutException(Exception):
+    pass
+
+def timeout_handler(signum, frame):
+    raise TimeoutException()
 
 # ═══════════════════════════════════════════════════════════════════
 # CONFIG & LOGS
@@ -45,6 +53,7 @@ TOKEN = os.environ.get("EO_TOKEN", "")
 SERVER = os.environ.get("EO_SERVER", "wss://fr24g1eu.expertoption.com/")
 API_SECRET = os.environ.get("BRIDGE_SECRET", "cambiar_esto")
 AMOUNT = int(os.environ.get("TRADE_AMOUNT", "10"))
+IS_DEMO = int(os.environ.get("EO_DEMO", "0"))
 
 STATIC_ASSET_MAP = {
     "BTC/USD":  160, "ETH/USD":  162, "XRP/USD":  173,
@@ -74,6 +83,22 @@ WS_RAW_DATA = {
 }
 WS_RAW_LOCK = threading.Lock()
 MAX_ASSETS = 200
+
+# ═══════════════════════════════════════════════════════════════════
+# WS HANDLERS (Silenciosos)
+# ═══════════════════════════════════════════════════════════════════
+
+def handle_candles(data):
+    candles = data.get("data", [])
+    if not candles:
+        return
+    # last_candle = candles[-1]
+    # TODO: conectar con tu lógica de señales si es necesario en el futuro
+    # log(f"[CANDLES] Recibidas {len(candles)} velas") 
+
+def handle_traders_choice(data):
+    # log(f"[TRADERS_CHOICE] {data}")
+    pass
 
 # ═══════════════════════════════════════════════════════════════════
 # WS INTERCEPTOR
@@ -128,6 +153,21 @@ def inject_ws_interceptor(expert):
                                                         pass
                                 elif sub_action == 'assets':
                                     _parse_raw_assets(sub.get('message', sub))
+
+                elif action == 'candles':
+                    handle_candles(data)
+
+                elif action == 'pong':
+                    return
+
+                elif action == 'tradersChoice':
+                    handle_traders_choice(data)
+
+                else:
+                    # Solo loggear acciones realmente inesperadas
+                    if action not in ["candles", "pong", "tradersChoice", "assets", "profile", "multipleAction"]:
+                        log(f"[WARN] Unknown action ignorada: {action}")
+
         except Exception:
             pass
 
@@ -298,8 +338,6 @@ def ensure_connection():
 # TRADE EXECUTION
 # ═══════════════════════════════════════════════════════════════════
 
-IS_DEMO = int(os.environ.get("EO_DEMO", "0"))
-
 def execute_trade(asset_str, direction, tf='5M'):
     global expert, GC_COUNTER
 
@@ -341,26 +379,31 @@ def execute_trade(asset_str, direction, tf='5M'):
     start_exec = time.time()
     result = None
 
-    for attempt in range(2):
-        try:
-            result = safe_buy()
-            break
-        except Exception as e:
-            if attempt == 1:
-                return {
-                    "status": "error",
-                    "reason": "EXECUTION_ERROR",
-                    "details": str(e)
-                }
-            time.sleep(0.5)
+    signal.signal(signal.SIGALRM, timeout_handler)
+    signal.alarm(8)
 
-    # ⏱ Timeout manual
-    elapsed = time.time() - start_exec
-    if elapsed > 8:
+    try:
+        for attempt in range(2):
+            try:
+                result = safe_buy()
+                break
+            except Exception as e:
+                if attempt == 1:
+                    raise e
+                time.sleep(0.5)
+        signal.alarm(0)
+    except TimeoutException:
         return {
             "status": "error",
             "reason": "TIMEOUT",
-            "details": f"Broker tardó {elapsed:.2f}s"
+            "details": "Broker no respondió en 8s"
+        }
+    except Exception as e:
+        signal.alarm(0)
+        return {
+            "status": "error",
+            "reason": "EXECUTION_ERROR",
+            "details": str(e)
         }
 
     log(f"[TRADE] ✅ Respuesta: {result}")
