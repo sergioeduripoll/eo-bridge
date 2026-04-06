@@ -347,14 +347,39 @@ def debug():
         try:
             store = getattr(expert, 'msg_by_action', {})
             info["msg_keys"] = list(store.keys()) if store else []
-            pm = store.get('profile') if store else None
-            if isinstance(pm, dict):
-                inner = pm.get('profile', pm)
-                if isinstance(inner, dict):
-                    info["demo_balance"] = inner.get('demo_balance')
-                    info["real_balance"] = inner.get('real_balance')
-                    info["is_demo"] = inner.get('is_demo')
-            info["threads"] = [t.name for t in threading.enumerate() if 'websocket' in t.name.lower() or 'thread' in t.name.lower()]
+            
+            # Buscar profile en multipleAction
+            ma = store.get('multipleAction')
+            if ma:
+                info["multipleAction_type"] = str(type(ma).__name__)
+                if isinstance(ma, dict):
+                    info["multipleAction_keys"] = list(ma.keys())[:20]
+                    # Buscar profile dentro
+                    for k, v in ma.items():
+                        if 'profile' in str(k).lower() or 'balance' in str(k).lower():
+                            info[f"ma_{k}"] = str(v)[:500]
+                elif isinstance(ma, list):
+                    info["multipleAction_len"] = len(ma)
+                    # Buscar profile en items
+                    for i, item in enumerate(ma[:10]):
+                        if isinstance(item, dict):
+                            if 'profile' in item or item.get('action') == 'profile':
+                                info[f"ma_item_{i}"] = str(item)[:500]
+                else:
+                    info["multipleAction_raw"] = str(ma)[:500]
+            
+            # Buscar balance en TODOS los atributos del expert
+            for attr_name in dir(expert):
+                if attr_name.startswith('_'): continue
+                try:
+                    val = getattr(expert, attr_name)
+                    if callable(val): continue
+                    val_str = str(val)
+                    if 'balance' in val_str.lower() or 'demo_balance' in val_str.lower() or '3.08' in val_str or '13698.50' in val_str:
+                        info[f"attr_{attr_name}"] = val_str[:500]
+                except: pass
+            
+            info["threads"] = [t.name for t in threading.enumerate()]
         except Exception as e:
             info["error"] = str(e)
     return jsonify(info)
