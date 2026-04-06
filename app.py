@@ -337,6 +337,60 @@ def debug():
         info["threads"] = [t.name for t in threading.enumerate()]
     return jsonify(info)
 
+# Captura temporal de mensajes para diagnóstico
+_CAPTURE = []
+_CAPTURING = False
+
+@app.route('/capture')
+def capture():
+    """Captura 8s de mensajes WS raw, envía profile request, muestra resultado."""
+    global _CAPTURING
+    _ensure()
+    if not expert:
+        return jsonify({"error":"no expert"})
+    
+    _CAPTURE.clear()
+    _CAPTURING = True
+    
+    # Inyectar capturador temporal
+    ws = getattr(expert, 'websocket_client', None)
+    if not ws:
+        return jsonify({"error":"no ws client"})
+    
+    current_handler = ws.on_message
+    
+    def capture_handler(ws_app, raw):
+        if _CAPTURING and isinstance(raw, str) and 'candle' not in raw and 'pong' not in raw and 'tradersChoice' not in raw and 'optStatus' not in raw:
+            _CAPTURE.append(raw[:500])
+        if current_handler:
+            try: current_handler(ws_app, raw)
+            except: pass
+    
+    ws.on_message = capture_handler
+    
+    # Pedir profile
+    try:
+        ws.send(json.dumps({"action":"profile","ns":99}))
+    except Exception as e1:
+        try:
+            sock = getattr(ws, 'sock', None)
+            if sock: sock.send(json.dumps({"action":"profile","ns":99}))
+        except Exception as e2:
+            _CAPTURING = False
+            ws.on_message = current_handler
+            return jsonify({"error":f"send failed: {e1} / {e2}"})
+    
+    # Esperar 8 segundos
+    time.sleep(8)
+    _CAPTURING = False
+    ws.on_message = current_handler
+    
+    return jsonify({
+        "captured_count": len(_CAPTURE),
+        "messages": _CAPTURE[:30],
+        "bal_after": {"demo":_BAL['demo'],"real":_BAL['real']},
+    })
+
 # ═══════════════════════════════════════════════════════════════════
 log(f"[BRIDGE] Cargado. {'DEMO' if IS_DEMO else 'REAL'} ${AMOUNT}. Lazy init.")
 
