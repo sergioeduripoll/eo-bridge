@@ -352,37 +352,95 @@ def connect_global():
         mode_str = "DEMO" if IS_DEMO else "REAL"
         log(f"[GLOBAL] 🔌 Conectando a ExpertOption (modo {mode_str}, monto ${AMOUNT})...")
         expert = EoApi(token=TOKEN, server_region=SERVER)
+        
+        # CRÍTICO: Inyectar interceptor ANTES de connect()
+        # así capturamos los mensajes profile/assets que llegan en el handshake
+        inject_ws_interceptor(expert)
+        
         expert.connect()
 
         start = time.time()
-        while time.time() - start < 12:
+        while time.time() - start < 15:
             if is_ws_alive(): break
             time.sleep(0.3)
 
+        # Re-inyectar por si connect() reemplazó los callbacks
         inject_ws_interceptor(expert)
 
         # NO llamar a SetReal()/SetDemo() — no existe en la librería
         # El modo se controla en cada Buy() con isdemo=IS_DEMO
 
+        # Pedir profile explícitamente (puede que el del handshake ya fue capturado)
+        time.sleep(1)  # Dar tiempo al WS para estabilizarse
+        for retry in range(3):
+            try:
+                ws_sock = getattr(expert.websocket_client, 'sock', None)
+                if ws_sock and ws_sock.connected:
+                    ws_sock.send(json.dumps({"action": "profile"}))
+                    ws_sock.send(json.dumps({"action": "assets"}))
+                    log(f"[GLOBAL] 📡 profile+assets solicitados (intento {retry+1})")
+                    break
+            except:
+                time.sleep(1)
+
+        # Esperar balance con timeout generoso (10s)
+        poll_start = time.time()
+        while time.time() - poll_start < 10:
+            with WS_RAW_LOCK:
+                bal = WS_RAW_DATA['balance']
+                demo = WS_RAW_DATA['demo_balance']
+                real = WS_RAW_DATA['real_balance']
+                ac = len(WS_RAW_DATA['assets'])
+            
+            # Aceptar si tenemos CUALQUIER balance (demo o real)
+            if demo is not None or real is not None:
+                active_bal = demo if IS_DEMO else real
+                WS_RAW_DATA['balance'] = active_bal
+                log(f"[GLOBAL] ✅ Conectado | Modo: {mode_str} | Demo: ${demo} | Real: ${real} | Activo: ${active_bal} | Assets: {ac}")
+                return True
+            time.sleep(0.5)
+
+        # Último intento: pedir profile una vez más
         try:
             ws_sock = getattr(expert.websocket_client, 'sock', None)
             if ws_sock and ws_sock.connected:
                 ws_sock.send(json.dumps({"action": "profile"}))
-                ws_sock.send(json.dumps({"action": "assets"}))
+                time.sleep(3)
+                with WS_RAW_LOCK:
+                    demo = WS_RAW_DATA['demo_balance']
+                    real = WS_RAW_DATA['real_balance']
+                if demo is not None or real is not None:
+                    active_bal = demo if IS_DEMO else real
+                    with WS_RAW_LOCK:
+                        WS_RAW_DATA['balance'] = active_bal
+                    log(f"[GLOBAL] ✅ Conectado (retry) | Activo: ${active_bal}")
+                    return True
         except: pass
 
-        poll_start = time.time()
-        while time.time() - poll_start < 5:
-            with WS_RAW_LOCK:
-                bal = WS_RAW_DATA['balance']
-                ac = len(WS_RAW_DATA['assets'])
-            if bal is not None and bal > 0:
-                log(f"[GLOBAL] ✅ Conectado | Modo: {mode_str} | Saldo: ${bal:.2f} | Assets: {ac}")
-                return True
-            time.sleep(0.5)
+        log(f"[GLOBAL] ⚠️ Conectado pero balance no recibido via WS. Intentando leer de la librería...")
+        
+        # FALLBACK: Leer balance directamente de los atributos internos de EoApi
+        try:
+            # La librería puede guardar el profile internamente
+            for attr in ['profile', 'user', '_profile', 'account']:
+                obj = getattr(expert, attr, None)
+                if obj and isinstance(obj, dict):
+                    demo = obj.get('demo_balance')
+                    real = obj.get('real_balance')
+                    if demo is not None or real is not None:
+                        with WS_RAW_LOCK:
+                            if demo is not None: WS_RAW_DATA['demo_balance'] = float(demo)
+                            if real is not None: WS_RAW_DATA['real_balance'] = float(real)
+                            WS_RAW_DATA['balance'] = float(demo) if IS_DEMO else float(real) if real else float(demo)
+                        log(f"[GLOBAL] ✅ Balance leído de expert.{attr}: Demo=${demo} Real=${real}")
+                        return True
+            
+            # Listar atributos del expert para debug
+            attrs = [a for a in dir(expert) if not a.startswith('__')]
+            log(f"[GLOBAL] 📋 Atributos de expert: {attrs[:30]}")
+        except Exception as ex:
+            log(f"[GLOBAL] Fallback falló: {ex}")
 
-        # Si no llegó el balance, igual intentar (puede llegar después)
-        log(f"[GLOBAL] ⚠️ Conectado pero balance no recibido aún. Continuando...")
         return True
     except Exception as e:
         log(f"[GLOBAL] ❌ Error: {e}")
@@ -605,6 +663,15 @@ def health():
         bal = WS_RAW_DATA['balance']
         demo = WS_RAW_DATA['demo_balance']
         real = WS_RAW_DATA['real_balance']
+    
+    # Si no tenemos balance, pedir profile al broker
+    if bal is None and is_ws_alive():
+        try:
+            ws_sock = getattr(expert.websocket_client, 'sock', None)
+            if ws_sock and ws_sock.connected:
+                ws_sock.send(json.dumps({"action": "profile"}))
+        except: pass
+    
     return jsonify({
         "status": "ok",
         "ws_alive": is_ws_alive(),
@@ -641,18 +708,31 @@ def trade():
 
 @app.route('/broker-status', methods=['GET'])
 def broker_status():
+    alive = is_ws_alive()
+    
+    # Si conectado pero sin balance, solicitar profile
+    with WS_RAW_LOCK:
+        bal = WS_RAW_DATA['balance']
+    if bal is None and alive:
+        try:
+            ws_sock = getattr(expert.websocket_client, 'sock', None)
+            if ws_sock and ws_sock.connected:
+                ws_sock.send(json.dumps({"action": "profile"}))
+                time.sleep(2)
+        except: pass
+
     with WS_RAW_LOCK:
         bal = WS_RAW_DATA['balance']
         demo = WS_RAW_DATA['demo_balance']
         real = WS_RAW_DATA['real_balance']
     return jsonify({
-        "connected": is_ws_alive(),
+        "connected": alive,
         "mode": "DEMO" if IS_DEMO else "REAL",
         "balance": bal,
         "demo_balance": demo,
         "real_balance": real,
         "trade_amount": AMOUNT,
-        "message": "Bridge operativo" if is_ws_alive() else "Sin conexión WS"
+        "message": "Bridge operativo" if alive else "Sin conexión WS"
     }), 200
 
 @app.route('/debug-assets', methods=['GET'])
