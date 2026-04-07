@@ -138,6 +138,27 @@ def _connect():
         
         log(f"[CONN] WS thread alive: {_alive()}")
         
+        # ═══════════════════════════════════════════════════════
+        # CRÍTICO: Cambiar contexto a REAL si IS_DEMO=0
+        # Sin esto, el broker rechaza con ERROR_EXPECT_DEMO_CONTEXT
+        # SetDemo() sin args = modo demo, SetDemo() retorna True
+        # Para REAL: necesitamos cambiar el contexto de la sesión
+        # ═══════════════════════════════════════════════════════
+        time.sleep(2)
+        if IS_DEMO == 0:
+            try:
+                # Enviar setContext para cambiar a real (is_demo=0)
+                expert.send_websocket_request(action="setContext", msg={"is_demo": 0})
+                time.sleep(1)
+                log("[CONN] 💵 Contexto cambiado a REAL")
+            except Exception as e:
+                log(f"[CONN] ⚠️ Error cambiando contexto: {e}")
+        else:
+            try:
+                expert.SetDemo()
+                log("[CONN] 🧪 Contexto DEMO")
+            except: pass
+        
         # Inyectar interceptor en el WebSocketApp real (wss)
         _inject(expert)
         
