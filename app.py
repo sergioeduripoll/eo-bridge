@@ -45,33 +45,22 @@ _TRD_LOCK = threading.Lock()
 # BALANCE — Lee de expert.profile (lo llena expert.Profile())
 # ═══════════════════════════════════════════════════════════════════
 def _fetch_balance():
-    """Llama expert.Profile() y lee el resultado de expert.profile."""
+    """Llama expert.Profile() — retorna el dict directamente (no lo guarda en atributo)."""
     if not expert: return None, None
     try:
-        expert.Profile()
-        time.sleep(2)  # Esperar respuesta del broker
-        
-        p = getattr(expert, 'profile', None)
-        if p and isinstance(p, dict):
-            prof = p.get('profile', p)
+        ret = expert.Profile()
+        if ret and isinstance(ret, dict):
+            msg = ret.get('message', ret)
+            prof = msg.get('profile', msg) if isinstance(msg, dict) else msg
             if isinstance(prof, dict):
                 return prof.get('demo_balance'), prof.get('real_balance')
-        
-        # Si profile es el objeto directo
-        if p and hasattr(p, 'get'):
-            return p.get('demo_balance'), p.get('real_balance')
     except Exception as e:
         log(f"[BAL] Error: {e}")
     return None, None
 
 def _get_bal():
-    if not expert: return None
-    p = getattr(expert, 'profile', None)
-    if p and isinstance(p, dict):
-        prof = p.get('profile', p)
-        if isinstance(prof, dict):
-            return prof.get('demo_balance') if IS_DEMO else prof.get('real_balance')
-    return None
+    demo, real = _fetch_balance()
+    return demo if IS_DEMO else real
 
 def _alive():
     if not expert: return False
@@ -154,14 +143,14 @@ def _connect():
         
         # Pedir profile usando el método nativo
         time.sleep(2)
-        log("[CONN] 📡 Pidiendo Profile()...")
+        log("[CONN] 📡 Profile()...")
         demo, real = _fetch_balance()
         
         if demo is not None or real is not None:
             active = demo if IS_DEMO else real
             log(f"[CONN] ✅ Demo=${demo} Real=${real} Activo=${active}")
         else:
-            log(f"[CONN] ⚠️ Profile() no devolvió balance. expert.profile={getattr(expert,'profile',None)}")
+            log(f"[CONN] ⚠️ Profile() sin balance")
         
         return True
     except Exception as e:
@@ -194,12 +183,8 @@ def _execute(asset, direction, tf='5M'):
     if not aid:
         return {"status":"error","reason":"INVALID_ASSET","details":f"No mapeado: {asset}"}
 
-    bal = _get_bal()
-    if bal is not None and bal < AMOUNT:
-        return {"status":"error","reason":"LOW_BAL","details":f"${bal:.2f}<${AMOUNT}"}
-
     m = "DEMO" if IS_DEMO else "REAL"
-    log(f"[TRADE] 🎯 {eo_type} {asset}(ID:{aid}) ${AMOUNT} [{m}] bal=${bal}")
+    log(f"[TRADE] 🎯 {eo_type} {asset}(ID:{aid}) ${AMOUNT} [{m}]")
 
     with _TRD_LOCK: _TRD['trade_id'] = None; _TRD['result'] = None
 
@@ -266,11 +251,10 @@ def _auth():
 @app.route('/health')
 def health():
     _ensure()
-    bal = _get_bal()
-    demo, real = _fetch_balance() if bal is None else (None, None)
-    if bal is None: bal = _get_bal()
+    demo, real = _fetch_balance()
+    bal = demo if IS_DEMO else real
     return jsonify({"status":"ok","ws_alive":_alive(),"mode":"DEMO" if IS_DEMO else "REAL",
-                    "balance":_get_bal(),"trade_amount":AMOUNT})
+                    "balance":bal,"demo_balance":demo,"real_balance":real,"trade_amount":AMOUNT})
 
 @app.route('/trade', methods=['POST'])
 def trade_route():
@@ -296,50 +280,11 @@ def broker_status():
 @app.route('/debug')
 def debug():
     _ensure()
-    info = {"ws_alive":_alive(),"expert":expert is not None}
-    if expert:
-        # 1. Qué retorna Profile()?
-        try:
-            ret = expert.Profile()
-            info["Profile_return"] = str(ret)[:500]
-            info["Profile_return_type"] = str(type(ret).__name__)
-        except Exception as e:
-            info["Profile_error"] = str(e)
-        
-        time.sleep(3)
-        info["profile_attr_after"] = str(getattr(expert, 'profile', None))[:500]
-        
-        # 2. Qué hay en msg_by_action ahora?
-        store = getattr(expert, 'msg_by_action', {})
-        info["msg_keys"] = list(store.keys()) if store else []
-        # Ver si profile apareció
-        for k in store.keys():
-            val = store[k]
-            s = str(val)
-            if 'balance' in s.lower() or 'profile' in s.lower():
-                info[f"store_{k}"] = s[:500]
-        
-        # 3. Qué retorna SetDemo?
-        try:
-            ret2 = expert.SetDemo()
-            info["SetDemo_return"] = str(ret2)[:300]
-        except Exception as e:
-            info["SetDemo_error"] = str(e)
-        
-        # 4. Revisar msg_by_ns
-        ns_store = getattr(expert, 'msg_by_ns', None)
-        if ns_store:
-            info["msg_by_ns_keys"] = list(ns_store.keys())[:20]
-            for k in list(ns_store.keys())[:5]:
-                v = ns_store[k]
-                if v is not None:
-                    info[f"ns_{k}"] = str(v)[:300]
-        
-        # 5. Revisar results
-        res_store = getattr(expert, 'results', None)
-        if res_store:
-            info["results_keys"] = list(res_store.keys())[:20]
-    return jsonify(info)
+    demo, real = _fetch_balance()
+    bal = demo if IS_DEMO else real
+    return jsonify({"ws_alive":_alive(),"mode":"DEMO" if IS_DEMO else "REAL",
+                    "demo_balance":demo,"real_balance":real,"active_balance":bal,
+                    "trade_amount":AMOUNT})
 
 # ═══════════════════════════════════════════════════════════════════
 log(f"[BRIDGE] v9. {'DEMO' if IS_DEMO else 'REAL'} ${AMOUNT}. Lazy init.")
