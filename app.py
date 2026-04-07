@@ -27,8 +27,9 @@ for p in ['expert', 'ExpertOptionAPI.expert']:
 TOKEN  = os.environ.get("EO_TOKEN", "")
 SERVER = os.environ.get("EO_SERVER", "wss://fr24g1eu.expertoption.com/")
 SECRET = os.environ.get("BRIDGE_SECRET", "cambiar_esto")
-AMOUNT = int(os.environ.get("TRADE_AMOUNT", "1"))
-IS_DEMO= int(os.environ.get("EO_DEMO", "0"))
+IS_DEMO= int(os.environ.get("EO_DEMO", "1"))             # <── 1=DEMO, 0=REAL
+TRADE_PCT = int(os.environ.get("TRADE_PERCENT", "10"))    # <── 10% del saldo
+MIN_AMOUNT = 1                                             # <── Mínimo $1
 
 ASSETS = {"BTC/USD":160,"ETH/USD":162,"XRP/USD":173,
           "ADA/USD":235,"SOL/USD":464,"DOGE/USD":463,"BNB/USD":462}
@@ -45,7 +46,7 @@ _TRD_LOCK = threading.Lock()
 # BALANCE — Lee de expert.profile (lo llena expert.Profile())
 # ═══════════════════════════════════════════════════════════════════
 def _fetch_balance():
-    """Llama expert.Profile() — retorna el dict directamente (no lo guarda en atributo)."""
+    """Llama expert.Profile() — retorna el dict directamente."""
     if not expert: return None, None
     try:
         ret = expert.Profile()
@@ -61,6 +62,14 @@ def _fetch_balance():
 def _get_bal():
     demo, real = _fetch_balance()
     return demo if IS_DEMO else real
+
+def _calc_amount():
+    """Calcula monto = TRADE_PCT% del saldo, redondeado abajo, mínimo $1."""
+    bal = _get_bal()
+    if bal is None or bal < MIN_AMOUNT:
+        return MIN_AMOUNT
+    amount = int(bal * TRADE_PCT / 100)  # int() trunca hacia abajo
+    return max(amount, MIN_AMOUNT)
 
 def _alive():
     if not expert: return False
@@ -198,14 +207,26 @@ def _execute(asset, direction, tf='5M'):
     if not expert:
         return {"status":"error","reason":"NO_CONNECTION","details":"Sin conexión"}
 
+    # Pre-check: verificar que el WS funciona intentando Profile()
+    try:
+        test = expert.Profile()
+        if not test or not isinstance(test, dict):
+            raise Exception("Profile vacío")
+    except:
+        log("[TRADE] ⚠️ WS muerto, reconectando antes de operar...")
+        with _lock: _connect()
+        if not expert:
+            return {"status":"error","reason":"RECONNECT_FAIL","details":"No se pudo reconectar"}
+
     eo_type = "call" if direction == "BUY" else "put"
     exp_t = TF_EXP.get(tf, 300)
     aid = ASSETS.get(asset)
     if not aid:
         return {"status":"error","reason":"INVALID_ASSET","details":f"No mapeado: {asset}"}
 
+    trade_amount = _calc_amount()
     m = "DEMO" if IS_DEMO else "REAL"
-    log(f"[TRADE] 🎯 {eo_type} {asset}(ID:{aid}) ${AMOUNT} [{m}]")
+    log(f"[TRADE] 🎯 {eo_type} {asset}(ID:{aid}) ${trade_amount} [{m}] (bal=${_get_bal()} {TRADE_PCT}%)")
 
     with _TRD_LOCK: _TRD['trade_id'] = None; _TRD['result'] = None
 
@@ -215,7 +236,7 @@ def _execute(asset, direction, tf='5M'):
     try:
         for att in range(2):
             try:
-                result = expert.Buy(amount=AMOUNT, type=eo_type, assetid=aid,
+                result = expert.Buy(amount=trade_amount, type=eo_type, assetid=aid,
                                      exptime=exp_t, isdemo=IS_DEMO, strike_time=time.time())
                 break
             except Exception as e:
@@ -238,7 +259,7 @@ def _execute(asset, direction, tf='5M'):
         return {"status":"error","reason":"REJECTED","details":f"{asset} inactivo"}
 
     resp = {"status":"success","asset":asset,"direction":direction,"type":eo_type,
-            "asset_id":aid,"amount":AMOUNT,"tf":tf,"mode":m,"trade_id":tid}
+            "asset_id":aid,"amount":trade_amount,"tf":tf,"mode":m,"trade_id":tid}
     with _TRD_LOCK:
         tr = _TRD.get('result')
     if tr: resp["open_rate"] = tr.get("open_rate")
@@ -252,12 +273,19 @@ def _watchdog():
     import urllib.request
     url = os.environ.get("RENDER_EXTERNAL_URL", "")
     while True:
-        time.sleep(300)
+        time.sleep(120)  # Cada 2 min (antes 5)
         if url:
             try: urllib.request.urlopen(f"{url}/health", timeout=10)
             except: pass
-        if _initialized and not _alive():
-            with _lock: _connect()
+        # Verificar si podemos hacer Profile() — si falla, reconectar
+        if _initialized:
+            try:
+                ret = expert.Profile() if expert else None
+                if not ret or not isinstance(ret, dict):
+                    raise Exception("Profile vacío")
+            except:
+                log("[WD] ⚠️ Profile falló, reconectando...")
+                with _lock: _connect()
         gc.collect()
         log(f"[WD] alive={'✅' if _alive() else '❌'} bal=${_get_bal()}")
 threading.Thread(target=_watchdog, daemon=True).start()
@@ -275,7 +303,7 @@ def health():
     demo, real = _fetch_balance()
     bal = demo if IS_DEMO else real
     return jsonify({"status":"ok","ws_alive":_alive(),"mode":"DEMO" if IS_DEMO else "REAL",
-                    "balance":bal,"demo_balance":demo,"real_balance":real,"trade_amount":AMOUNT})
+                    "balance":bal,"trade_pct":TRADE_PCT,"next_amount":_calc_amount()})
 
 @app.route('/trade', methods=['POST'])
 def trade_route():
@@ -291,12 +319,12 @@ def trade_route():
 @app.route('/broker-status')
 def broker_status():
     _ensure()
-    # Siempre pedir balance fresco
     demo, real = _fetch_balance()
-    bal = _get_bal()
+    bal = demo if IS_DEMO else real
     return jsonify({"connected":_alive(),"mode":"DEMO" if IS_DEMO else "REAL",
                     "balance":bal,"demo_balance":demo,"real_balance":real,
-                    "trade_amount":AMOUNT,"message":"OK" if _alive() else "Sin WS"})
+                    "trade_pct":TRADE_PCT,"next_amount":_calc_amount(),
+                    "message":"OK" if _alive() else "Sin WS"})
 
 @app.route('/debug')
 def debug():
@@ -308,7 +336,7 @@ def debug():
                     "trade_amount":AMOUNT})
 
 # ═══════════════════════════════════════════════════════════════════
-log(f"[BRIDGE] v9. {'DEMO' if IS_DEMO else 'REAL'} ${AMOUNT}. Lazy init.")
+log(f"[BRIDGE] v10. {'DEMO' if IS_DEMO else 'REAL'} {TRADE_PCT}% del saldo. Lazy init.")
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT",8080)))
