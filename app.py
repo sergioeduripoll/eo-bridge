@@ -1,17 +1,16 @@
 """
-app.py v8 — Puente ExpertOption FINAL
-- Conexión LAZY (dentro del worker de gunicorn)
-- _alive() usa websocket_thread.is_alive() (no sock.connected que falla)
-- Interceptor captura profile/balance del stream WS
-- Pide profile explícito después de inyectar interceptor
-- Balance se cachea en _BAL dict
+app.py v9 — Puente ExpertOption DEFINITIVO
+- Usa expert.Profile() para pedir balance (método nativo de la librería)
+- Usa expert.send_websocket_request() para enviar mensajes
+- _alive() via websocket_thread.is_alive()
+- Balance se lee de expert.profile después de llamar Profile()
+- Conexión LAZY dentro del worker de gunicorn
 """
 
 import os, time, json, gc, threading, signal as sig
 
 class TimeoutErr(Exception): pass
 def _alarm_h(s, f): raise TimeoutErr()
-
 def log(msg): print(msg, flush=True)
 
 from flask import Flask, request, jsonify
@@ -31,103 +30,100 @@ SECRET = os.environ.get("BRIDGE_SECRET", "cambiar_esto")
 AMOUNT = int(os.environ.get("TRADE_AMOUNT", "1"))
 IS_DEMO= int(os.environ.get("EO_DEMO", "0"))
 
-ASSETS = {"BTC/USD":160,"ETH/USD":162,"XRP/USD":173,"ADA/USD":235,"SOL/USD":464,"DOGE/USD":463,"BNB/USD":462}
+ASSETS = {"BTC/USD":160,"ETH/USD":162,"XRP/USD":173,
+          "ADA/USD":235,"SOL/USD":464,"DOGE/USD":463,"BNB/USD":462}
 TF_EXP = {'5M':300,'15M':900,'30M':1800,'1H':3600}
 
 expert = None
 _lock = threading.Lock()
 _last_reconn = 0
 _initialized = False
-
-# Balance cache — actualizado por el interceptor
-_BAL = {'demo': None, 'real': None, 'ts': 0}
-_BAL_LOCK = threading.Lock()
-
-# Trade info — actualizado por el interceptor  
 _TRD = {'trade_id': None, 'result': None}
 _TRD_LOCK = threading.Lock()
 
 # ═══════════════════════════════════════════════════════════════════
+# BALANCE — Lee de expert.profile (lo llena expert.Profile())
+# ═══════════════════════════════════════════════════════════════════
+def _fetch_balance():
+    """Llama expert.Profile() y lee el resultado de expert.profile."""
+    if not expert: return None, None
+    try:
+        expert.Profile()
+        time.sleep(2)  # Esperar respuesta del broker
+        
+        p = getattr(expert, 'profile', None)
+        if p and isinstance(p, dict):
+            prof = p.get('profile', p)
+            if isinstance(prof, dict):
+                return prof.get('demo_balance'), prof.get('real_balance')
+        
+        # Si profile es el objeto directo
+        if p and hasattr(p, 'get'):
+            return p.get('demo_balance'), p.get('real_balance')
+    except Exception as e:
+        log(f"[BAL] Error: {e}")
+    return None, None
+
+def _get_bal():
+    if not expert: return None
+    p = getattr(expert, 'profile', None)
+    if p and isinstance(p, dict):
+        prof = p.get('profile', p)
+        if isinstance(prof, dict):
+            return prof.get('demo_balance') if IS_DEMO else prof.get('real_balance')
+    return None
+
 def _alive():
-    """Check si el WS está vivo usando el thread de la librería."""
     if not expert: return False
     try:
         wt = getattr(expert, 'websocket_thread', None)
-        if wt and wt.is_alive(): return True
-    except: pass
-    return False
-
-def _get_bal():
-    with _BAL_LOCK:
-        return _BAL['demo'] if IS_DEMO else _BAL['real']
-
-def _parse_profile_from_msg(data):
-    """Extrae balance de cualquier mensaje que contenga profile."""
-    try:
-        if not isinstance(data, dict): return
-        
-        # Directo: {"action":"profile","message":{"profile":{...}}}
-        msg = data.get('message', data)
-        if isinstance(msg, dict):
-            prof = msg.get('profile', msg)
-            if isinstance(prof, dict) and ('demo_balance' in prof or 'real_balance' in prof):
-                with _BAL_LOCK:
-                    if prof.get('demo_balance') is not None: _BAL['demo'] = float(prof['demo_balance'])
-                    if prof.get('real_balance') is not None: _BAL['real'] = float(prof['real_balance'])
-                    _BAL['ts'] = time.time()
-                log(f"[BAL] Demo=${_BAL['demo']} Real=${_BAL['real']}")
-                return
-        
-        # Dentro de multipleAction: {"action":"multipleAction","message":[{...},{...}]}
-        if isinstance(msg, list):
-            for item in msg:
-                if isinstance(item, dict):
-                    _parse_profile_from_msg(item)
-    except: pass
+        return wt and wt.is_alive()
+    except: return False
 
 # ═══════════════════════════════════════════════════════════════════
+# INTERCEPTOR — Captura trade_id de respuestas del broker
+# ═══════════════════════════════════════════════════════════════════
 def _inject(exp):
-    """Intercepta TODOS los mensajes del WS para capturar profile y trade_id."""
     ws = getattr(exp, 'websocket_client', None)
-    if not ws: return False
-    orig = ws.on_message
-
-    def _on(ws_app, raw):
-        # Primero pasar al original (la librería necesita procesar)
+    if not ws: return
+    
+    # El WS real es ws.wss (WebSocketApp), los callbacks están ahí
+    wss = getattr(ws, 'wss', None)
+    if not wss: return
+    
+    orig = wss.on_message
+    
+    def _on(wss_app, raw):
+        # Primero dejar que la librería procese
         if orig:
-            try: orig(ws_app, raw)
+            try: orig(wss_app, raw)
             except: pass
         
-        # Ahora nosotros procesamos
+        # Nosotros capturamos trade_id y openTradeSuccessful
         try:
-            if not isinstance(raw, str): return
-            if len(raw) < 20: return
+            if not isinstance(raw, str) or len(raw) < 20: return
             
-            # FAST: solo parsear si contiene algo que nos interesa
-            if 'profile' in raw or 'balance' in raw:
-                data = json.loads(raw)
-                _parse_profile_from_msg(data)
-            
-            elif '"trade_id"' in raw:
-                data = json.loads(raw)
-                tid = data.get('message',{}).get('trade_id')
+            if '"trade_id"' in raw:
+                d = json.loads(raw)
+                tid = d.get('message',{}).get('trade_id')
                 if tid:
                     with _TRD_LOCK: _TRD['trade_id'] = tid
                     log(f"[WS] 🎫 trade_id: {tid}")
             
             elif 'openTradeSuccessful' in raw:
-                data = json.loads(raw)
-                t = data.get('message',{}).get('trade',{})
+                d = json.loads(raw)
+                t = d.get('message',{}).get('trade',{})
                 if t:
                     with _TRD_LOCK:
                         _TRD['result'] = {'id':t.get('id'),'open_rate':t.get('open_rate'),'is_demo':t.get('is_demo')}
                     log(f"[WS] ✅ id={t.get('id')} open={t.get('open_rate')}")
         except: pass
+    
+    wss.on_message = _on
+    log("[WS] ✅ Interceptor en wss.on_message")
 
-    ws.on_message = _on
-    log("[WS] ✅ Interceptor inyectado")
-    return True
-
+# ═══════════════════════════════════════════════════════════════════
+# CONEXIÓN
 # ═══════════════════════════════════════════════════════════════════
 def _connect():
     global expert
@@ -135,59 +131,37 @@ def _connect():
         log("[CONN] ❌ Sin EoApi/TOKEN"); return False
     try:
         if expert:
-            try:
-                ws = getattr(expert, 'websocket_client', None)
-                if ws:
-                    try: ws.close()
-                    except: pass
+            try: getattr(expert,'websocket_client',None) and expert.websocket_client.reconnect()
             except: pass
             expert = None; gc.collect()
 
         m = "DEMO" if IS_DEMO else "REAL"
-        log(f"[CONN] 🔌 Conectando ({m}, ${AMOUNT})...")
+        log(f"[CONN] 🔌 ({m}, ${AMOUNT})...")
         expert = EoApi(token=TOKEN, server_region=SERVER)
         expert.connect()
 
-        # Esperar que el thread del WS arranque
         for _ in range(50):
             if _alive(): break
             time.sleep(0.3)
         
         if not _alive():
-            log("[CONN] ⚠️ Thread WS no detectado, esperando más...")
             time.sleep(5)
         
-        # Inyectar interceptor — AHORA capturamos profile del stream
+        log(f"[CONN] WS thread alive: {_alive()}")
+        
+        # Inyectar interceptor en el WebSocketApp real (wss)
         _inject(expert)
         
-        # Esperar a que la librería reciba profile (llega en los primeros segundos)
-        time.sleep(3)
+        # Pedir profile usando el método nativo
+        time.sleep(2)
+        log("[CONN] 📡 Pidiendo Profile()...")
+        demo, real = _fetch_balance()
         
-        # Si no llegó balance aún, pedir profile explícitamente
-        if _get_bal() is None:
-            log("[CONN] 📡 Solicitando profile...")
-            try:
-                ws = getattr(expert, 'websocket_client', None)
-                if ws:
-                    # Intentar enviar via el send de la librería
-                    try:
-                        ws.send(json.dumps({"action":"profile","ns":99}))
-                    except:
-                        # Fallback: enviar via sock directo
-                        sock = getattr(ws, 'sock', None)
-                        if sock:
-                            sock.send(json.dumps({"action":"profile","ns":99}))
-            except Exception as e:
-                log(f"[CONN] Error solicitando profile: {e}")
-            
-            time.sleep(5)
-            
-            if _get_bal() is not None:
-                log(f"[CONN] ✅ Balance obtenido: ${_get_bal()}")
-            else:
-                log(f"[CONN] ⚠️ Sin balance aún. El interceptor lo capturará cuando llegue.")
+        if demo is not None or real is not None:
+            active = demo if IS_DEMO else real
+            log(f"[CONN] ✅ Demo=${demo} Real=${real} Activo=${active}")
         else:
-            log(f"[CONN] ✅ Balance inmediato: Demo=${_BAL['demo']} Real=${_BAL['real']}")
+            log(f"[CONN] ⚠️ Profile() no devolvió balance. expert.profile={getattr(expert,'profile',None)}")
         
         return True
     except Exception as e:
@@ -204,6 +178,8 @@ def _ensure():
         _last_reconn = time.time()
         return _connect()
 
+# ═══════════════════════════════════════════════════════════════════
+# TRADE
 # ═══════════════════════════════════════════════════════════════════
 def _execute(asset, direction, tf='5M'):
     if not EoApi or not TOKEN:
@@ -264,6 +240,8 @@ def _execute(asset, direction, tf='5M'):
     return resp
 
 # ═══════════════════════════════════════════════════════════════════
+# WATCHDOG
+# ═══════════════════════════════════════════════════════════════════
 def _watchdog():
     import urllib.request
     url = os.environ.get("RENDER_EXTERNAL_URL", "")
@@ -279,6 +257,8 @@ def _watchdog():
 threading.Thread(target=_watchdog, daemon=True).start()
 
 # ═══════════════════════════════════════════════════════════════════
+# RUTAS
+# ═══════════════════════════════════════════════════════════════════
 def _auth():
     a = request.headers.get('Authorization','')
     return a.startswith('Bearer ') and a.split(' ',1)[1] == SECRET
@@ -286,9 +266,11 @@ def _auth():
 @app.route('/health')
 def health():
     _ensure()
+    bal = _get_bal()
+    demo, real = _fetch_balance() if bal is None else (None, None)
+    if bal is None: bal = _get_bal()
     return jsonify({"status":"ok","ws_alive":_alive(),"mode":"DEMO" if IS_DEMO else "REAL",
-                    "balance":_get_bal(),"demo_balance":_BAL['demo'],"real_balance":_BAL['real'],
-                    "trade_amount":AMOUNT})
+                    "balance":_get_bal(),"trade_amount":AMOUNT})
 
 @app.route('/trade', methods=['POST'])
 def trade_route():
@@ -304,138 +286,30 @@ def trade_route():
 @app.route('/broker-status')
 def broker_status():
     _ensure()
-    alive = _alive()
-    # Si estamos vivos pero sin balance, pedir profile
-    if alive and _get_bal() is None:
-        try:
-            ws = getattr(expert, 'websocket_client', None)
-            if ws:
-                try: ws.send(json.dumps({"action":"profile","ns":99}))
-                except:
-                    sock = getattr(ws, 'sock', None)
-                    if sock: sock.send(json.dumps({"action":"profile","ns":99}))
-                time.sleep(3)
-        except: pass
-    return jsonify({"connected":alive,"mode":"DEMO" if IS_DEMO else "REAL",
-                    "balance":_get_bal(),"demo_balance":_BAL['demo'],"real_balance":_BAL['real'],
-                    "trade_amount":AMOUNT,"message":"OK" if alive else "Sin WS"})
+    # Siempre pedir balance fresco
+    demo, real = _fetch_balance()
+    bal = _get_bal()
+    return jsonify({"connected":_alive(),"mode":"DEMO" if IS_DEMO else "REAL",
+                    "balance":bal,"demo_balance":demo,"real_balance":real,
+                    "trade_amount":AMOUNT,"message":"OK" if _alive() else "Sin WS"})
 
 @app.route('/debug')
 def debug():
     _ensure()
-    info = {"ws_alive":_alive(),"expert":expert is not None,"init":_initialized,
-            "bal_demo":_BAL['demo'],"bal_real":_BAL['real'],"bal_ts":_BAL['ts']}
+    info = {"ws_alive":_alive(),"expert":expert is not None}
     if expert:
+        info["profile_raw"] = str(getattr(expert, 'profile', None))[:500]
+        # Intentar Profile() y ver qué pasa
         try:
-            wt = getattr(expert, 'websocket_thread', None)
-            info["ws_thread_alive"] = wt.is_alive() if wt else False
-            info["profile_attr"] = str(getattr(expert, 'profile', 'N/A'))[:200]
-            store = getattr(expert, 'msg_by_action', {})
-            info["msg_keys"] = list(store.keys()) if store else []
+            expert.Profile()
+            time.sleep(3)
+            info["profile_after_call"] = str(getattr(expert, 'profile', None))[:500]
         except Exception as e:
-            info["err"] = str(e)
-        info["threads"] = [t.name for t in threading.enumerate()]
+            info["profile_call_error"] = str(e)
     return jsonify(info)
 
-# Captura temporal de mensajes para diagnóstico
-_CAPTURE = []
-_CAPTURING = False
-
-@app.route('/capture')
-def capture():
-    """Diagnóstico: intenta TODAS las formas de enviar y recibir mensajes."""
-    _ensure()
-    if not expert:
-        return jsonify({"error":"no expert"})
-    
-    results = {}
-    ws = getattr(expert, 'websocket_client', None)
-    
-    # 1. Intentar enviar con distintos métodos
-    methods_tried = []
-    
-    # Método A: ws.send()
-    try:
-        ws.send('{"action":"profile","ns":99}')
-        methods_tried.append("ws.send ✅")
-    except Exception as e:
-        methods_tried.append(f"ws.send ❌ {e}")
-    
-    # Método B: ws.sock.send()
-    try:
-        sock = getattr(ws, 'sock', None)
-        if sock:
-            sock.send('{"action":"profile","ns":98}')
-            methods_tried.append("ws.sock.send ✅")
-        else:
-            methods_tried.append("ws.sock = None")
-    except Exception as e:
-        methods_tried.append(f"ws.sock.send ❌ {e}")
-    
-    # Método C: expert.send() o expert.SendMessage()
-    for method_name in ['send', 'SendMessage', 'send_message', 'sendMessage', 'Send']:
-        fn = getattr(expert, method_name, None)
-        if fn and callable(fn):
-            try:
-                fn({"action":"profile"})
-                methods_tried.append(f"expert.{method_name}() ✅")
-            except Exception as e:
-                try:
-                    fn('{"action":"profile"}')
-                    methods_tried.append(f"expert.{method_name}(str) ✅")
-                except Exception as e2:
-                    methods_tried.append(f"expert.{method_name}() ❌ {e} / {e2}")
-    
-    results["send_methods"] = methods_tried
-    
-    # 2. Listar TODOS los métodos callable del expert
-    expert_methods = []
-    for name in dir(expert):
-        if name.startswith('_'): continue
-        try:
-            val = getattr(expert, name)
-            if callable(val):
-                expert_methods.append(name)
-        except: pass
-    results["expert_methods"] = expert_methods
-    
-    # 3. Listar métodos del websocket_client
-    ws_methods = []
-    if ws:
-        for name in dir(ws):
-            if name.startswith('_'): continue
-            try:
-                val = getattr(ws, name)
-                if callable(val):
-                    ws_methods.append(name)
-            except: pass
-    results["ws_methods"] = ws_methods
-    
-    # 4. Listar atributos del websocket_client
-    ws_attrs = {}
-    if ws:
-        for name in dir(ws):
-            if name.startswith('_'): continue
-            try:
-                val = getattr(ws, name)
-                if not callable(val):
-                    ws_attrs[name] = str(val)[:200]
-            except: pass
-    results["ws_attrs"] = ws_attrs
-    
-    # 5. Esperar 5s y ver si profile llegó
-    time.sleep(5)
-    results["bal_after"] = {"demo":_BAL['demo'],"real":_BAL['real']}
-    results["profile_after"] = str(getattr(expert, 'profile', None))[:300]
-    
-    # 6. Revisar msg_by_action de nuevo
-    store = getattr(expert, 'msg_by_action', {})
-    results["msg_keys_after"] = list(store.keys()) if store else []
-    
-    return jsonify(results)
-
 # ═══════════════════════════════════════════════════════════════════
-log(f"[BRIDGE] Cargado. {'DEMO' if IS_DEMO else 'REAL'} ${AMOUNT}. Lazy init.")
+log(f"[BRIDGE] v9. {'DEMO' if IS_DEMO else 'REAL'} ${AMOUNT}. Lazy init.")
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT",8080)))
