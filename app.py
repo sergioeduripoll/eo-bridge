@@ -298,14 +298,47 @@ def debug():
     _ensure()
     info = {"ws_alive":_alive(),"expert":expert is not None}
     if expert:
-        info["profile_raw"] = str(getattr(expert, 'profile', None))[:500]
-        # Intentar Profile() y ver qué pasa
+        # 1. Qué retorna Profile()?
         try:
-            expert.Profile()
-            time.sleep(3)
-            info["profile_after_call"] = str(getattr(expert, 'profile', None))[:500]
+            ret = expert.Profile()
+            info["Profile_return"] = str(ret)[:500]
+            info["Profile_return_type"] = str(type(ret).__name__)
         except Exception as e:
-            info["profile_call_error"] = str(e)
+            info["Profile_error"] = str(e)
+        
+        time.sleep(3)
+        info["profile_attr_after"] = str(getattr(expert, 'profile', None))[:500]
+        
+        # 2. Qué hay en msg_by_action ahora?
+        store = getattr(expert, 'msg_by_action', {})
+        info["msg_keys"] = list(store.keys()) if store else []
+        # Ver si profile apareció
+        for k in store.keys():
+            val = store[k]
+            s = str(val)
+            if 'balance' in s.lower() or 'profile' in s.lower():
+                info[f"store_{k}"] = s[:500]
+        
+        # 3. Qué retorna SetDemo?
+        try:
+            ret2 = expert.SetDemo()
+            info["SetDemo_return"] = str(ret2)[:300]
+        except Exception as e:
+            info["SetDemo_error"] = str(e)
+        
+        # 4. Revisar msg_by_ns
+        ns_store = getattr(expert, 'msg_by_ns', None)
+        if ns_store:
+            info["msg_by_ns_keys"] = list(ns_store.keys())[:20]
+            for k in list(ns_store.keys())[:5]:
+                v = ns_store[k]
+                if v is not None:
+                    info[f"ns_{k}"] = str(v)[:300]
+        
+        # 5. Revisar results
+        res_store = getattr(expert, 'results', None)
+        if res_store:
+            info["results_keys"] = list(res_store.keys())[:20]
     return jsonify(info)
 
 # ═══════════════════════════════════════════════════════════════════
