@@ -134,7 +134,7 @@ def _connect():
             expert = None; gc.collect()
 
         m = "DEMO" if IS_DEMO else "REAL"
-        log(f"[CONN] 🔌 ({m}, ${AMOUNT})...")
+        log(f"[CONN] 🔌 ({m}, {TRADE_PCT}% del saldo)...")
         expert = EoApi(token=TOKEN, server_region=SERVER)
         expert.connect()
 
@@ -333,7 +333,7 @@ def debug():
     bal = demo if IS_DEMO else real
     return jsonify({"ws_alive":_alive(),"mode":"DEMO" if IS_DEMO else "REAL",
                     "demo_balance":demo,"real_balance":real,"active_balance":bal,
-                    "trade_amount":AMOUNT})
+                    "trade_pct":TRADE_PCT,"next_amount":_calc_amount()})
 
 # ═══════════════════════════════════════════════════════════════════
 log(f"[BRIDGE] v10. {'DEMO' if IS_DEMO else 'REAL'} {TRADE_PCT}% del saldo. Lazy init.")
