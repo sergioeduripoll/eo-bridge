@@ -343,53 +343,96 @@ _CAPTURING = False
 
 @app.route('/capture')
 def capture():
-    """Captura 8s de mensajes WS raw, envía profile request, muestra resultado."""
-    global _CAPTURING
+    """Diagnóstico: intenta TODAS las formas de enviar y recibir mensajes."""
     _ensure()
     if not expert:
         return jsonify({"error":"no expert"})
     
-    _CAPTURE.clear()
-    _CAPTURING = True
-    
-    # Inyectar capturador temporal
+    results = {}
     ws = getattr(expert, 'websocket_client', None)
-    if not ws:
-        return jsonify({"error":"no ws client"})
     
-    current_handler = ws.on_message
+    # 1. Intentar enviar con distintos métodos
+    methods_tried = []
     
-    def capture_handler(ws_app, raw):
-        if _CAPTURING and isinstance(raw, str) and 'candle' not in raw and 'pong' not in raw and 'tradersChoice' not in raw and 'optStatus' not in raw:
-            _CAPTURE.append(raw[:500])
-        if current_handler:
-            try: current_handler(ws_app, raw)
-            except: pass
-    
-    ws.on_message = capture_handler
-    
-    # Pedir profile
+    # Método A: ws.send()
     try:
-        ws.send(json.dumps({"action":"profile","ns":99}))
-    except Exception as e1:
+        ws.send('{"action":"profile","ns":99}')
+        methods_tried.append("ws.send ✅")
+    except Exception as e:
+        methods_tried.append(f"ws.send ❌ {e}")
+    
+    # Método B: ws.sock.send()
+    try:
+        sock = getattr(ws, 'sock', None)
+        if sock:
+            sock.send('{"action":"profile","ns":98}')
+            methods_tried.append("ws.sock.send ✅")
+        else:
+            methods_tried.append("ws.sock = None")
+    except Exception as e:
+        methods_tried.append(f"ws.sock.send ❌ {e}")
+    
+    # Método C: expert.send() o expert.SendMessage()
+    for method_name in ['send', 'SendMessage', 'send_message', 'sendMessage', 'Send']:
+        fn = getattr(expert, method_name, None)
+        if fn and callable(fn):
+            try:
+                fn({"action":"profile"})
+                methods_tried.append(f"expert.{method_name}() ✅")
+            except Exception as e:
+                try:
+                    fn('{"action":"profile"}')
+                    methods_tried.append(f"expert.{method_name}(str) ✅")
+                except Exception as e2:
+                    methods_tried.append(f"expert.{method_name}() ❌ {e} / {e2}")
+    
+    results["send_methods"] = methods_tried
+    
+    # 2. Listar TODOS los métodos callable del expert
+    expert_methods = []
+    for name in dir(expert):
+        if name.startswith('_'): continue
         try:
-            sock = getattr(ws, 'sock', None)
-            if sock: sock.send(json.dumps({"action":"profile","ns":99}))
-        except Exception as e2:
-            _CAPTURING = False
-            ws.on_message = current_handler
-            return jsonify({"error":f"send failed: {e1} / {e2}"})
+            val = getattr(expert, name)
+            if callable(val):
+                expert_methods.append(name)
+        except: pass
+    results["expert_methods"] = expert_methods
     
-    # Esperar 8 segundos
-    time.sleep(8)
-    _CAPTURING = False
-    ws.on_message = current_handler
+    # 3. Listar métodos del websocket_client
+    ws_methods = []
+    if ws:
+        for name in dir(ws):
+            if name.startswith('_'): continue
+            try:
+                val = getattr(ws, name)
+                if callable(val):
+                    ws_methods.append(name)
+            except: pass
+    results["ws_methods"] = ws_methods
     
-    return jsonify({
-        "captured_count": len(_CAPTURE),
-        "messages": _CAPTURE[:30],
-        "bal_after": {"demo":_BAL['demo'],"real":_BAL['real']},
-    })
+    # 4. Listar atributos del websocket_client
+    ws_attrs = {}
+    if ws:
+        for name in dir(ws):
+            if name.startswith('_'): continue
+            try:
+                val = getattr(ws, name)
+                if not callable(val):
+                    ws_attrs[name] = str(val)[:200]
+            except: pass
+    results["ws_attrs"] = ws_attrs
+    
+    # 5. Esperar 5s y ver si profile llegó
+    time.sleep(5)
+    results["bal_after"] = {"demo":_BAL['demo'],"real":_BAL['real']}
+    results["profile_after"] = str(getattr(expert, 'profile', None))[:300]
+    
+    # 6. Revisar msg_by_action de nuevo
+    store = getattr(expert, 'msg_by_action', {})
+    results["msg_keys_after"] = list(store.keys()) if store else []
+    
+    return jsonify(results)
 
 # ═══════════════════════════════════════════════════════════════════
 log(f"[BRIDGE] Cargado. {'DEMO' if IS_DEMO else 'REAL'} ${AMOUNT}. Lazy init.")
